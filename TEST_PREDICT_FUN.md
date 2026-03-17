@@ -22,17 +22,14 @@ cargo run --bin test_predict_fun
 
 ## Current Status
 
-The script is set up to test the following endpoints:
-- ✅ Get Markets
-- ✅ Get Market by ID
-- ✅ Get Orderbook (Bid/Ask prices)
-- ✅ Get Auth Message
-- ✅ Create Order (requires authentication)
+The script tests the following endpoints (all use `/v1/` prefix):
+- ✅ Get Markets (`GET /v1/markets`)
+- ✅ Get Market by ID (`GET /v1/markets/{id}`)
+- ✅ Get Orderbook (`GET /v1/markets/{id}/orderbook`)
+- ✅ Get Auth Message (`GET /v1/auth/message`)
+- ⏭️ Create Order is documented; run with auth when ready (`POST /v1/orders`)
 
-**Note**: The endpoints may return 404 if:
-1. The API endpoint structure is different than expected
-2. The testnet doesn't have active markets
-3. The API requires different authentication
+The test uses the first market from the list for orderbook and market-by-ID checks.
 
 ## Next Steps
 
@@ -55,23 +52,23 @@ The script is set up to test the following endpoints:
    - Once authenticated, test creating buy/sell orders
    - Start with small test orders on testnet
 
-## API Endpoints (Based on Documentation)
+## API Endpoints (Correct Paths)
 
-According to https://dev.predict.fun/, the API should support:
+All endpoints use the **`/v1/`** prefix. Base URLs: mainnet `https://api.predict.fun`, testnet `https://api-testnet.predict.fun`.
 
 ### Markets
-- `GET /markets` - Get all markets
-- `GET /markets/{id}` - Get market by ID
-- `GET /markets/{id}/orderbook` - Get orderbook (bid/ask prices)
+- `GET /v1/markets` - Get all markets (response: `{ success, data: Market[] }`)
+- `GET /v1/markets/{id}` - Get market by ID (numeric id)
+- `GET /v1/markets/{id}/orderbook` - Get orderbook (bid/ask prices)
 
 ### Orders
-- `POST /orders` - Create an order
-- `GET /orders` - Get your orders
-- `POST /orders/remove` - Cancel orders
+- `POST /v1/orders` - Create an order
+- `GET /v1/orders` - Get your orders
+- `POST /v1/orders/remove` - Cancel orders
 
 ### Authentication
-- `GET /authorization/auth-message` - Get message to sign
-- `POST /authorization/jwt` - Get JWT token with signature
+- `GET /v1/auth/message` - Get message to sign (response: `{ data: { message } }`)
+- `POST /v1/auth` - Get JWT with signature (body: `{ signer, message, signature }`, response: `{ data: { token } }`)
 
 ## Example Usage
 
@@ -83,9 +80,10 @@ let message = client.get_auth_message().await?;
 
 // 2. Sign message with your private key (implement signing logic)
 let signature = sign_message(&message, &private_key)?;
+let signer_address = "0x..."; // your wallet address
 
-// 3. Authenticate
-client.authenticate(signature, message).await?;
+// 3. Authenticate (POST /v1/auth with signer, message, signature)
+client.authenticate(signer_address.to_string(), message, signature).await?;
 
 // 4. Get markets
 let markets = client.get_markets().await?;

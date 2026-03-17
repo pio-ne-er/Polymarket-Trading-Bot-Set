@@ -1,0 +1,39 @@
+{
+  "polymarket": {
+    "gamma_api_url": "https://gamma-api.polymarket.com",
+    "clob_api_url": "https://clob.polymarket.com",
+    "api_key": "019c52ee-beab-74a5-a8f5-e37181b68a43",
+    "api_secret": "5Fi9Obqxp9g_CrVmGPRll387NdGx5AOPd-1hPzZswTo=",
+    "api_passphrase": "ed7ec32c32d1f8fac98b1308e2d7edd093ecd55efae92c56ee0761307d8b0153",
+    "private_key": "87bf7a79e471caa6b08129d97f58d98bba8273d69df396734e579f921a0e6830",
+    "proxy_wallet_address": "0x6BeCc3dd357C39ba2bE536Efe95782742674ABf1",
+    "signature_type": 2
+  },
+  "trading": {
+    "eth_condition_id": null,
+    "btc_condition_id": null,
+    "solana_condition_id": null,
+    "xrp_condition_id": null,
+    "check_interval_ms": 500,
+    "fixed_trade_amount": 4.5,
+    "min_elapsed_minutes": 8,
+    "min_time_remaining_seconds": 30,
+    "market_closure_check_interval_seconds": 10,
+    "sell_price": 0.98,
+    "max_buy_price": 0.95,
+    "trigger_price": 0.87,
+    "stop_loss_price": 0.80,
+    "hedge_price": 0.5,
+    "enable_eth_trading": false,
+    "enable_solana_trading": false,
+    "enable_xrp_trading": false,
+    "dual_limit_price": 0.47,
+    "dual_limit_shares": 50.0,
+    "dual_limit_hedge_after_minutes": 10,
+    "dual_limit_hedge_price": 0.83,
+    "dual_limit_early_hedge_minutes": 5,
+    "dual_limit_trend_strength_threshold": 0.3,
+    "dual_limit_trend_price_buffer": 0.05,
+    "dual_limit_trend_history_size": 60
+  }
+}

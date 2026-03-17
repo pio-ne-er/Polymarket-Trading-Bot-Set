@@ -212,6 +212,53 @@ impl SimulationTracker {
         }
     }
 
+    /// Record a market buy as filled immediately in simulation (no limit order; position created at fill_price).
+    pub async fn add_market_buy_position(
+        &self,
+        token_id: String,
+        token_type: TokenType,
+        condition_id: String,
+        fill_price: f64,
+        units: f64,
+        period_timestamp: u64,
+    ) {
+        let investment_amount = units * fill_price;
+        let position = SimulatedPosition {
+            token_id: token_id.clone(),
+            token_type: token_type.clone(),
+            condition_id,
+            purchase_price: fill_price,
+            units,
+            investment_amount,
+            sell_price: None,
+            purchase_timestamp: std::time::Instant::now(),
+            period_timestamp,
+            sold: false,
+            sell_price_actual: None,
+            sell_timestamp: None,
+        };
+        {
+            let mut positions = self.positions.lock().await;
+            positions.insert(token_id.clone(), position);
+        }
+        {
+            let mut total_invested = self.total_invested.lock().await;
+            *total_invested += investment_amount;
+        }
+        let token_type_str = match &token_type {
+            TokenType::BtcUp | TokenType::EthUp | TokenType::SolanaUp | TokenType::XrpUp => "Up",
+            TokenType::BtcDown | TokenType::EthDown | TokenType::SolanaDown | TokenType::XrpDown => "Down",
+        };
+        self.log_to_file(&format!(
+            "✅ SIMULATION: Market BUY filled - {} ({}), Price: ${:.6}, Units: {:.6}, Investment: ${:.2}",
+            &token_id[..16.min(token_id.len())],
+            token_type_str,
+            fill_price,
+            units,
+            investment_amount
+        )).await;
+    }
+
     /// Track price for trend analysis
     /// Call this whenever you receive new price data
     pub async fn track_price(

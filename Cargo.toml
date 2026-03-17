@@ -33,8 +33,20 @@ name = "main_dual_limit_045"
 path = "src/bin/main_dual_limit_045.rs"
 
 [[bin]]
+name = "main_dual_limit_045_same_size"
+path = "src/bin/main_dual_limit_045_same_size.rs"
+
+[[bin]]
+name = "main_dual_limit_045_5m_btc"
+path = "src/bin/main_dual_limit_045_5m_btc.rs"
+
+[[bin]]
 name = "main_dual_limit_1h"
 path = "src/bin/main_dual_limit_1h.rs"
+
+[[bin]]
+name = "main_trailing"
+path = "src/bin/main_trailing.rs"
 
 [[bin]]
 name = "polymarket-arbitrage-bot-limit"
@@ -52,6 +64,7 @@ path = "src/bin/backtest.rs"
 tokio = { version = "1.35", features = ["full"] }
 reqwest = { version = "0.11", features = ["json"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"

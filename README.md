@@ -98,7 +98,66 @@ cargo run --bin main_dual_limit_045 -- --no-simulation
 cargo run --bin backtest -- --backtest
 ```
 
-### 4. Dual Limit-Start Bot (1-hour)
+### 4b. Dual Limit Same-Size Bot (0.45)
+**Binary:** `main_dual_limit_045_same_size`
+
+Same as the Dual Limit-Start Bot (0.45) but with simpler hedge behavior: if both initial orders fill, no further trading; if only one fills, **2-min / 4-min / early / standard** hedge buys the unfilled token at market for the same size and cancels the unfilled $0.45 limit. No reentry logic.
+
+**Strategy:**
+- At market start (first ~5 seconds), place limit buys for BTC and enabled ETH/SOL/XRP Up/Down at $0.45
+- If **both** orders fill → no further trading for that market
+- If **only one** fills: **2-min** (trailing on ask), **4-min**, **early**, or **standard** hedge — buy unfilled at market for same size (1×), cancel the unfilled limit. No immediate limit sell; position is held until the **low-price exit** below (if it applies) or market closure.
+
+**When do we place the two limit sell orders (0.05 / 0.99 or 0.02 / 0.99)?**  
+The bot places **two** limit sell orders (cheap token at $0.05 or $0.02, opposite at $0.99) only when **all** of the following are true:
+
+1. **At least 10 minutes** have elapsed in the period.
+2. The market was hedged via **4-min, early, or standard** hedge (not via 2-min). **2-min hedges do not get these exit orders** — they are held until market closure.
+3. One side’s **bid** has dropped **below 0.10** (or below 0.03 for the 0.02/0.99 path when hedge price &lt; 0.60).  
+   Then: sell the cheap token at **$0.05** (or $0.02) and the opposite at **$0.99**.
+
+**Why you might not see limit sell orders:**
+- You hedged via **2-min** → no low-price exit; no 0.05/0.99 orders are placed for that market.
+- Less than **10 minutes** have elapsed in the period.
+- No side has dropped below the threshold (e.g. bid &lt; 0.10) yet.
+- (Dual-filled-at-0.45 exit is disabled by default; that would place 0.02/0.99 when both filled at 0.45 and one side &lt; 0.03.)
+
+**Run:**
+```bash
+cargo run --bin main_dual_limit_045_same_size -- --simulation
+cargo run --bin main_dual_limit_045_same_size -- --no-simulation
+```
+
+### 4c. Dual Limit 5-Minute BTC Bot
+**Binary:** `main_dual_limit_045_5m_btc`
+
+Dual limit at $0.45 for **BTC 5-minute markets only**. No ETH/SOL/XRP 5m markets. Two windows with **trailing + bands**: **2-min** (2–3 min) and **3-min** (≥3 min). No uptick or [0.43, 0.47] band.
+
+**Strategy:**
+- **Market start (first ~5 s):** Place limit buys for **BTC Up** and **BTC Down** at $0.45 (`dual_limit_shares` or `fixed_trade_amount / price`). Skip if already have a position for that token in this period.
+- **Both fill** → no further trading.
+- **Only one fills:** Track **lowest unfilled ASK** per market. Time-based **bands**: 2–3 min → ask &lt; 0.45; ≥3 min → ask &lt; 0.50. If ask ≥ band, update `lowest_ask = ask` (or **allow buy above band** if we had a valid dip: `lowest_ask ≤ band − dual_limit_hedge_trailing_stop`). **Trigger:** buy when `ask ≥ lowest_ask + dual_limit_hedge_trailing_stop` (default 0.03). Entering 3-min window resets `lowest_ask` once (new baseline) unless allowing buy above band.
+  - **2-min window** (elapsed **[2 min, 3 min)**): Band 0.45, trailing on ask → buy at ask, cancel limit, record in `two_min_hedge_markets`.
+  - **3-min window** (elapsed **≥ 3 min**): Band 0.50; only consider when **0.55 &lt; ask &lt; hedge_price** (default 0.85). Same trailing; on trigger → buy at ask, cancel limit, record in `hedge_executed_for_market`.
+- **Early placement:** After 3 min, if at least one side is filled, try to discover the **next** 5m period and place limit buys for it before it starts.
+
+**Constants (in code):** `NINETY_SEC_AFTER_SECONDS = 120`, `THREE_MIN_AFTER_SECONDS = 180`, `BAND_2MIN = 0.45`, `BAND_3MIN = 0.5`. From 3 min: no lower bound on ask (buy when price drops). Config: `dual_limit_hedge_trailing_stop` (default 0.03).
+
+**Config:** Same `config.json` / `config-red.json` (`dual_limit_price`, `dual_limit_shares`, `dual_limit_hedge_price`, `dual_limit_hedge_trailing_stop`). ETH/SOL/XRP flags ignored (BTC 5m only).
+
+**Run:**
+```bash
+# Simulation
+cargo run --bin main_dual_limit_045_5m_btc -- --config config.json --simulation
+
+# Production
+cargo run --bin main_dual_limit_045_5m_btc -- --config config.json --no-simulation
+cargo run --bin main_dual_limit_045_5m_btc -- --config config-red.json --no-simulation
+```
+
+**Note:** Market discovery uses slug `btc-updown-5m-<timestamp>` (5-minute period timestamp). If Polymarket uses a different slug format for 5m markets, discovery may need to be updated.
+
+### 5. Dual Limit-Start Bot (1-hour)
 **Binary:** `main_dual_limit_1h`
 
 Same strategy as the 15-minute bot, but targets 1-hour BTC/ETH/SOL/XRP up/down markets.
@@ -118,7 +177,52 @@ cargo run --bin main_dual_limit_1h -- --simulation
 cargo run --bin main_dual_limit_1h -- --no-simulation
 ```
 
-### 5. Backtest Mode
+### 6. Trailing Bot
+**Binary:** `main_trailing`
+
+Uses the **CLOB market WebSocket** (`wss://ws-subscriptions-clob.polymarket.com/ws/market`) for real-time bid/ask prices instead of REST polling. Token IDs are subscribed on connect and when the period changes; the monitor builds snapshots from the WebSocket price cache. Logging and strategy logic are unchanged.
+
+Waits until one token’s price is **under 0.45**, then starts trailing that token. Applies a **trailing stop** for the first buy (with a 0.45 trigger cap and reset-if-above-0.45 rule), then **stop loss + trailing stop** for the opposite token.
+
+**Strategy:**
+- **Entry:** Do **not** start trailing from market start. Wait until one token (Up or Down) has price **&lt; 0.45**. Then start trailing that token (track lowest/highest). If both are under 0.45, pick the one with lower ask.
+- **First token (trailing stop):** No time-window price bands. Track **lowest** and **highest** of the chosen token. When **current ≥ lowest + `trailing_stop_point`**: if **trigger &gt; 0.45** ignore and set lowest = 0.45; if price goes **above 0.45** without triggering, **reset** and wait for under 0.45 again. When trigger is valid (trigger ≤ 0.45) and current is not above the recorded highest, **buy** (min cost $1). Remember **shares** and **price** bought.
+- **Second token (opposite):** All time windows are **from the moment the first token was bought** (not market start). Hedging windows depend on market period:
+  - **15-minute markets (defaults):** first window 2 min, second 4 min. **5-minute markets (defaults):** first window 1 min, second 2m30s. Override with `trailing_first_window_seconds` and `trailing_second_window_seconds` (e.g. 90 and 180 for 1m30s and 3min).
+  - **Stop loss (always active):** Buy opposite when opposite price **≥ (1 − first_bought_price + 0.10)**. No ceiling check; the buy always executes. (Buffer 0.10 = `STOP_LOSS_BUFFER` in code.)
+  - **Trailing stop:** Buy when **current ≥ opposite_lowest + `trailing_stop_point`** only if opposite price is at or below the ceiling for **time since first buy**:
+    - **Within first window of first buy** (2 min for 15m, 1 min for 5m): opposite price ≤ (1 − first_bought − 0.05)
+    - **Within second window** (4 min for 15m, 2m30s for 5m): opposite price ≤ (1 − first_bought)
+    - **After early-hedge minutes from first buy** (config `dual_limit_early_hedge_minutes`): opposite price ≤ (1 − first_bought)
+  - Between second window and early-hedge from first buy, ceiling remains (1 − first_bought). If the trailing trigger fires but opposite is above the ceiling, the buy is skipped.
+  - **After second window (2m30s / 4min):** If **first_bought_price + opposite_ask > 1.1**, buy the second token **immediately** (no trailing or ceiling check). If the sum is ≤ 1.1, keep trailing the second token as above.
+- **One hedge per market:** After the second buy, the market is marked done.
+- **Second buy top-up:** If the second (opposite) token buy fills for less than the first token amount (e.g. partial fill or balance check failed), the trader spawns a background task that waits ~5s, checks balance, and places a market top-up order for the shortfall so the opposite side matches the first buy size (same logic as dual-limit hedge top-up).
+- **Hedge balance reconciliation:** After the second buy (live only), the bot waits 5s, then fetches both token balances. If the difference is **greater than 1 share**, it places one market order to buy more of the **lower** side so that the two sides end up within **1 share** of each other (critical for equal exposure at resolution).
+- **Balance checking with retries:** All balance checks that affect trade size (post-buy confirmation, hedge top-up, reconciliation) use **retries** (e.g. 5 attempts, 4s apart) so that delayed chain/indexer updates don’t produce 0 or wrong balances. The reported balance is the **maximum** seen across attempts to avoid understating the position.
+- **Most exact fill size: order `size_matched`:** After a market buy, the bot first tries to get the filled amount from the **exchange order** (CLOB API get_order → `size_matched`). That is the most exact source: the exchange reports how much the order filled as soon as it matches, with no chain or indexer delay. If that fails, it falls back to balance checks with retries, then to the requested order size.
+- **Cached CLOB connection:** The authenticated CLOB client (TCP + TLS + L2 auth) is created once and reused for all order and balance calls. This avoids a new handshake on every `place_market_order`, `get_order_filled_shares`, `check_balance_only`, `cancel_order`, etc., reducing latency for sending and confirming orders. Call `api.clear_clob_client_cache()` after a 401 if you need to force re-auth.
+- **History:** Each completed pair is appended to **`history/trailing_trades.jsonl`** with `up_bought_price`, `up_shares`, `down_bought_price`, `down_shares`, and `mode` (simulation/live).
+
+**Config (in `config.json` / `config.example.json`):**
+- `trading.trailing_stop_point` – trailing step in price (e.g. 0.03). Default 0.03.
+- `trading.trailing_shares` – number of shares per buy. Default 10 (or falls back to `dual_limit_shares` / `fixed_trade_amount / 0.5`).
+- `trading.trailing_market_minutes` – market period: **15** for 15-minute markets (e.g. `btc-updown-15m-*`), **5** for 5-minute markets (e.g. `btc-updown-5m-*`). Default: 15. Hedging window defaults: 5m → 1 min, 2m30s; 15m → 2 min, 4 min (overridable via the window config below).
+- `trading.trailing_stop_loss_enabled` – when **true** (default), the second (opposite) token is also bought when price ≥ (1 − first_bought + 0.10) (stop loss). When **false**, only the trailing-stop trigger is used for the second buy (no stop-loss buy).
+- `trading.trailing_use_websocket` – when **true** (default), prices are read from the CLOB market WebSocket. When **false**, prices are fetched via REST polling (same as pre–WebSocket behavior).
+- `trading.trailing_first_window_seconds` – (optional) second-token first hedging window in seconds. If set, overrides the default (60 for 5m markets, 120 for 15m). Example: **90** for 1 minute 30 seconds.
+- `trading.trailing_second_window_seconds` – (optional) second-token second hedging window in seconds. If set, overrides the default (150 for 5m, 240 for 15m). Example: **180** for 3 minutes.
+
+**Run:**
+```bash
+# Simulation (no real orders)
+cargo run --bin main_trailing -- --simulation
+
+# Production
+cargo run --bin main_trailing -- --no-simulation
+```
+
+### 7. Backtest Mode
 **Binary:** `backtest`
 
 Simulates the Dual Limit-Start Bot (0.45) strategy using historical price data from the `history/` folder.

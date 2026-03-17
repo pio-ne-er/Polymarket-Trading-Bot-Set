@@ -1,5 +1,6 @@
 use crate::models::*;
 use anyhow::{Context, Result};
+use std::convert::TryFrom;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -12,6 +13,8 @@ use log::{warn, info, error};
 use std::sync::Arc;
 
 // Official SDK imports for proper order signing
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType, Amount};
 use polymarket_client_sdk::{POLYGON, contract_config};
@@ -19,9 +22,13 @@ use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
 use alloy::primitives::Address as AlloyAddress;
 
+/// Cached authenticated CLOB client type (reused to avoid re-handshake on every order/balance call).
+type ClobClientAuthenticated = ClobClient<Authenticated<Normal>>;
+
 // CTF (Conditional Token Framework) imports for redemption
 // Based on docs: https://docs.polymarket.com/developers/builders/relayer-client#redeem-positions
-use alloy::primitives::{Address as AlloyAddressPrimitive, B256, U256, Bytes};
+use alloy::primitives::{Address as AlloyAddressPrimitive, B256, TxKind, U256, Bytes};
+use alloy::primitives::keccak256;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::TransactionRequest;
 
@@ -40,6 +47,11 @@ sol! {
         function setApprovalForAll(address operator, bool approved) external;
         function isApprovedForAll(address account, address operator) external view returns (bool);
     }
+
+    #[sol(rpc)]
+    interface IConditionalTokens {
+        function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external;
+    }
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -57,6 +69,8 @@ pub struct PolymarketApi {
     signature_type: Option<u8>, // 0 = EOA, 1 = Proxy, 2 = GnosisSafe
     // Track if authentication was successful at startup
     authenticated: Arc<tokio::sync::Mutex<bool>>,
+    /// Cached authenticated CLOB client so we reuse connection/L2 auth instead of re-handshaking every order or balance call.
+    clob_client_cache: Arc<tokio::sync::Mutex<Option<ClobClientAuthenticated>>>,
 }
 
 impl PolymarketApi {
@@ -86,7 +100,59 @@ impl PolymarketApi {
             proxy_wallet_address,
             signature_type,
             authenticated: Arc::new(tokio::sync::Mutex::new(false)),
+            clob_client_cache: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    /// Returns a clone of the cached authenticated CLOB client, or creates and caches one. Reusing the client avoids a new TCP/TLS and L2 auth handshake on every order or balance call.
+    async fn get_or_create_clob_client(&self) -> Result<ClobClientAuthenticated> {
+        {
+            let guard = self.clob_client_cache.lock().await;
+            if let Some(ref c) = *guard {
+                return Ok(c.clone());
+            }
+        }
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for CLOB. Set private_key in config.json"))?;
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key")?
+            .with_chain_id(Some(POLYGON));
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer);
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context("Failed to parse proxy_wallet_address")?;
+            auth_builder = auth_builder.funder(funder_address);
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) => anyhow::bail!("proxy_wallet_address set but signature_type 0 (EOA)"),
+                None => SignatureType::Proxy,
+                Some(n) => anyhow::bail!("Invalid signature_type: {}", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        } else if let Some(sig_type_num) = self.signature_type {
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        }
+        let client = auth_builder
+            .authenticate()
+            .await
+            .map_err(|e| anyhow::anyhow!("CLOB authenticate: {}", e))?;
+        let mut guard = self.clob_client_cache.lock().await;
+        *guard = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Clear cached CLOB client (e.g. after 401). Next call will re-authenticate.
+    pub async fn clear_clob_client_cache(&self) {
+        let mut guard = self.clob_client_cache.lock().await;
+        *guard = None;
     }
     
 
@@ -94,72 +160,11 @@ impl PolymarketApi {
     /// This verifies credentials (private_key + API credentials)
     /// Equivalent to JavaScript: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress)
     pub async fn authenticate(&self) -> Result<()> {
-        // Check if we have required credentials
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for authentication. Please set private_key in config.json"))?;
-        
-        // Create signer from private key (equivalent to: new Wallet(PRIVATE_KEY))
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
-        
-        // Build authentication builder with proxy wallet support
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
-            auth_builder = auth_builder.funder(funder_address);
-            
-            // Set signature type based on config or default to Proxy
-            // IMPORTANT: The signature type must match what was used when deriving API credentials
-            // For proxy wallets, use 1 (POLY_PROXY) for Magic Link/Google login, or 2 (GNOSIS_SAFE) for browser wallet
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) => {
-                    anyhow::bail!(
-                        "Invalid configuration: proxy_wallet_address is set but signature_type is 0 (EOA).\n\
-                        For proxy wallets, use signature_type: 1 (POLY_PROXY) for Magic Link/Google login, or 2 (GNOSIS_SAFE) for browser wallet.\n\
-                        If your API credentials were derived with a different signature type, you need to re-derive them with the correct type."
-                    );
-                },
-                None => {
-                    eprintln!("⚠️  WARNING: proxy_wallet_address is set but signature_type is not specified.");
-                    eprintln!("   Defaulting to POLY_PROXY (type 1). If your API credentials were derived with GNOSIS_SAFE (type 2),");
-                    eprintln!("   set signature_type: 2 in config.json or re-derive credentials with type 1.");
-                    SignatureType::Proxy
-                },
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
-            auth_builder = auth_builder.signature_type(sig_type);
-            eprintln!("🔐 Using proxy wallet: {} (signature type: {:?})", proxy_addr, sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            // If signature type is set but no proxy wallet, validate it's EOA
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        // Authenticate (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress))
-        // This verifies that both private_key and API credentials are valid
-        let _client = auth_builder
-            .authenticate()
-            .await
+        let _ = self.get_or_create_clob_client().await
             .context("Failed to authenticate with CLOB API. Check your API credentials (api_key, api_secret, api_passphrase) and private_key.")?;
-        
-        // Mark as authenticated
         *self.authenticated.lock().await = true;
         
-        eprintln!("✅ Successfully authenticated with Polymarket CLOB API");
+        eprintln!("✅ Successfully authenticated with Polymarket CLOB API (connection cached for faster orders)");
         eprintln!("   ✓ Private key: Valid");
         eprintln!("   ✓ API credentials: Valid");
         if let Some(proxy_addr) = &self.proxy_wallet_address {
@@ -213,6 +218,36 @@ impl PolymarketApi {
         let signature = hex::encode(result.into_bytes());
         
         Ok(signature)
+    }
+
+    /// Builder Relayer HMAC: message = timestamp(ms) + method + path + body, signature = base64url.
+    /// Must match Polymarket builder-signing-sdk for relayer auth.
+    fn builder_relayer_signature(
+        api_secret: &str,
+        timestamp_ms: u64,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<String> {
+        let message = format!("{}{}{}{}", timestamp_ms, method, path, body);
+        let secret_bytes = {
+            use base64::engine::general_purpose;
+            use base64::Engine;
+            if let Ok(b) = general_purpose::URL_SAFE.decode(api_secret) {
+                b
+            } else if let Ok(b) = general_purpose::STANDARD.decode(api_secret) {
+                b
+            } else {
+                api_secret.as_bytes().to_vec()
+            }
+        };
+        let mut mac = HmacSha256::new_from_slice(&secret_bytes)
+            .context("Failed to create HMAC for builder relayer")?;
+        mac.update(message.as_bytes());
+        let sig = mac.finalize().into_bytes();
+        use base64::engine::general_purpose;
+        use base64::Engine;
+        Ok(general_purpose::URL_SAFE.encode(sig.as_slice()))
     }
 
     /// Add authentication headers to a request
@@ -449,51 +484,13 @@ impl PolymarketApi {
     /// 
     /// Equivalent to JavaScript: client.createAndPostOrder(userOrder)
     pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {
-        // Check if we have a private key (required for signing)
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for place_order")?;
         let private_key = self.private_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
-        
-        // Create signer from private key (equivalent to: new Wallet(PRIVATE_KEY))
         let signer = LocalSigner::from_str(private_key)
             .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
             .with_chain_id(Some(POLYGON));
-        
-        // Build authentication builder with proxy wallet support
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
-            auth_builder = auth_builder.funder(funder_address);
-            
-            // Set signature type based on config or default to Proxy
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) | None => SignatureType::Proxy, // Default to Proxy when proxy wallet is set
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            // If signature type is set but no proxy wallet, validate it's EOA
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        // Create CLOB client with authentication (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress))
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
         
         // Convert order side string to SDK Side enum
         let side = match order.side.as_str() {
@@ -557,51 +554,86 @@ impl PolymarketApi {
         Ok(order_response)
     }
 
+    /// Place multiple limit orders in a single API request (batch).
+    /// Returns one response per order in the same order. Each response has order_id/status/message;
+    /// success is indicated by message starting with "Order ID:".
+    pub async fn place_limit_orders(&self, orders: &[OrderRequest]) -> Result<Vec<OrderResponse>> {
+        if orders.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for place_orders")?;
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing."))?;
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key")?
+            .with_chain_id(Some(POLYGON));
+        let mut signed_orders = Vec::with_capacity(orders.len());
+        for order in orders.iter() {
+            let side = match order.side.as_str() {
+                "BUY" => Side::Buy,
+                "SELL" => Side::Sell,
+                _ => anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", order.side),
+            };
+            let price = rust_decimal::Decimal::from_str(&order.price)
+                .context(format!("Failed to parse price: {}", order.price))?;
+            let size = rust_decimal::Decimal::from_str(&order.size)
+                .context(format!("Failed to parse size: {}", order.size))?;
+            let order_builder = client
+                .limit_order()
+                .token_id(&order.token_id)
+                .size(size)
+                .price(price)
+                .side(side);
+            let signed = client.sign(&signer, order_builder.build().await?)
+                .await
+                .context("Failed to sign order")?;
+            signed_orders.push(signed);
+        }
+        eprintln!("📤 Posting {} limit orders in one batch...", signed_orders.len());
+        let responses = client.post_orders(signed_orders).await
+            .context("Failed to post batch limit orders")?;
+        let mut out = Vec::with_capacity(responses.len());
+        for (i, resp) in responses.into_iter().enumerate() {
+            let token_id = orders.get(i).map(|o| o.token_id.as_str()).unwrap_or("?");
+            out.push(OrderResponse {
+                order_id: Some(resp.order_id.clone()),
+                status: resp.status.to_string(),
+                message: if resp.success {
+                    Some(format!("Order ID: {}", resp.order_id))
+                } else {
+                    resp.error_msg.clone()
+                },
+            });
+            if !resp.success {
+                eprintln!("   Order {} (token {}...) rejected: {}", i + 1, &token_id[..token_id.len().min(16)], resp.error_msg.as_deref().unwrap_or("unknown"));
+            }
+        }
+        Ok(out)
+    }
+
     /// Cancel a specific order by order id (CLOB)
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        // Check if we have a private key (required for auth/signing)
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for canceling orders. Please set private_key in config.json"))?;
-
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
-
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            auth_builder = auth_builder.funder(funder_address);
-
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) | None => SignatureType::Proxy,
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for cancel_order")?;
 
         eprintln!("🛑 Cancelling order: {}", order_id);
         client.cancel_order(order_id).await
             .context(format!("Failed to cancel order {}", order_id))?;
-        eprintln!("✅ Cancel request submitted for order: {}", order_id);
+        eprintln!("✅ Order cancel confirmed for order: {}", order_id);
         Ok(())
+    }
+
+    /// Fetch order by ID and return the filled size in shares (size_matched).
+    /// This is the most exact source for "how much did this order fill": the exchange reports it immediately after match, with no chain/indexer delay.
+    /// Returns None if the order cannot be fetched or size_matched is zero/invalid.
+    pub async fn get_order_filled_shares(&self, order_id: &str) -> Result<Option<f64>> {
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for get_order")?;
+        let order = client.order(order_id).await.context("Failed to fetch order")?;
+        use rust_decimal::prelude::ToPrimitive;
+        let shares = order.size_matched.to_f64().filter(|&s| s > 0.0);
+        Ok(shares)
     }
 
     /// Discover current BTC or ETH 15-minute market
@@ -643,19 +675,23 @@ impl PolymarketApi {
 
     /// Get all tokens in portfolio with balance > 0
     /// Get all tokens in portfolio with balance > 0, checking recent markets (not just current)
-    /// Checks current market and recent past markets (up to 10 periods = 2.5 hours) to find tokens from resolved markets
-    pub async fn get_portfolio_tokens_all(&self, btc_condition_id: Option<&str>, eth_condition_id: Option<&str>) -> Result<Vec<(String, f64, String, String)>> {
+    /// Uses REDEEM_SCAN_PERIODS and a delay between requests to avoid 429 rate limits.
+    /// Configured for BTC 5-minute markets (btc-updown-5m-{period}).
+    pub async fn get_portfolio_tokens_all(&self, _btc_condition_id: Option<&str>, _eth_condition_id: Option<&str>) -> Result<Vec<(String, f64, String, String)>> {
+        const PERIOD_SECS: u64 = 300; // 5-minute markets
+        const REDEEM_SCAN_PERIODS: u32 = 72; // 72 × 5 min = 6 hours
+        const DELAY_BETWEEN_PERIODS_MS: u64 = 200; // Delay between each period check to avoid rate limits
         let mut tokens_with_balance = Vec::new();
         
-        // Check BTC markets (current + recent past)
-        println!("🔍 Scanning BTC markets (current + recent past)...");
-        for offset in 0..=10 { // Check last 10 periods (2.5 hours)
+        // Check BTC 5-minute markets (current + previous periods)
+        println!("🔍 Scanning BTC 5-minute markets (current + last {} periods ≈ 6h)...", REDEEM_SCAN_PERIODS);
+        for offset in 0..=REDEEM_SCAN_PERIODS {
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let period_to_check = (current_time / 900) * 900 - (offset * 900);
-            let slug = format!("btc-updown-15m-{}", period_to_check);
+            let period_to_check = (current_time / PERIOD_SECS) * PERIOD_SECS - (offset as u64) * PERIOD_SECS;
+            let slug = format!("btc-updown-5m-{}", period_to_check);
             
             if let Ok(market) = self.get_market_by_slug(&slug).await {
                 let condition_id = market.condition_id.clone();
@@ -678,8 +714,15 @@ impl PolymarketApi {
                     }
                 }
             }
+            // Delay between period checks to avoid 429 Too Many Requests (Cloudflare/relayer rate limit)
+            if offset < REDEEM_SCAN_PERIODS {
+                tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_BETWEEN_PERIODS_MS)).await;
+            }
         }
         
+        // ETH and Solana scanning disabled temporarily (trading BTC only)
+        // Uncomment the blocks below to re-enable.
+        /*
         // Check ETH markets (current + recent past)
         println!("🔍 Scanning ETH markets (current + recent past)...");
         for offset in 0..=10 { // Check last 10 periods (2.5 hours)
@@ -753,6 +796,7 @@ impl PolymarketApi {
                 }
             }
         }
+        */
         
         Ok(tokens_with_balance)
     }
@@ -868,49 +912,13 @@ impl PolymarketApi {
     /// Returns (usdc_balance, usdc_allowance) as Decimal values
     /// For BUY orders, you need USDC balance and USDC allowance to the Exchange contract
     pub async fn check_usdc_balance_allowance(&self) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal)> {
-        // Authenticate first
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key required for balance check"))?;
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for USDC balance check")?;
         
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key")?
-            .with_chain_id(Some(POLYGON));
-        
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}", proxy_addr))?;
-            auth_builder = auth_builder.funder(funder_address);
-            
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) | None => SignatureType::Proxy,
-                Some(n) => anyhow::bail!("Invalid signature_type: {}", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate for USDC balance check")?;
-        
-        // Get USDC token address (collateral token)
-        const USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-        
-        // The SDK requires a BalanceAllowanceRequest built with builder pattern
+        // For USDC (collateral/ERC20), the API requires asset_id to be empty ("erc20 operation, asset must be empty").
         use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-        
-        // Build the request: BalanceAllowanceRequest::builder().token_id(token_id).asset_type(...).build()
-        // For USDC (collateral token), use AssetType::Collateral
         use polymarket_client_sdk::clob::types::AssetType;
         let request = BalanceAllowanceRequest::builder()
-            .token_id(USDC_ADDRESS)
             .asset_type(AssetType::Collateral)
             .build();
         
@@ -938,58 +946,8 @@ impl PolymarketApi {
     /// Returns balance as Decimal value
     /// This is faster than check_balance_allowance since it doesn't check allowances
     pub async fn check_balance_only(&self, token_id: &str) -> Result<rust_decimal::Decimal> {
-        // Check if we have a private key (required for signing)
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for balance check. Please set private_key in config.json"))?;
-        
-        // Create signer from private key
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
-        
-        // Build authentication builder with proxy wallet support
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
-            auth_builder = auth_builder.funder(funder_address);
-            
-            // Set signature type based on config
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) => {
-                    anyhow::bail!(
-                        "Invalid configuration: proxy_wallet_address is set but signature_type is 0 (EOA).\n\
-                        For proxy wallets, use signature_type: 1 (POLY_PROXY) or 2 (GNOSIS_SAFE)."
-                    );
-                },
-                None => {
-                    SignatureType::Proxy
-                },
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        // Create CLOB client with authentication
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate with CLOB API for balance check")?;
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for balance check")?;
         
         // Get balance using SDK (only balance, not allowance)
         use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
@@ -1008,62 +966,49 @@ impl PolymarketApi {
         Ok(balance_allowance.balance)
     }
 
+    /// Like check_balance_only but retries up to max_attempts with delay_secs between attempts.
+    /// Waits initial_wait_secs before the first attempt (e.g. for chain to settle after a fill).
+    /// Returns the maximum balance seen across attempts to avoid understating (e.g. indexer delay).
+    pub async fn check_balance_only_with_retry(
+        &self,
+        token_id: &str,
+        initial_wait_secs: u64,
+        max_attempts: u32,
+        delay_secs: u64,
+    ) -> Result<rust_decimal::Decimal> {
+        tokio::time::sleep(tokio::time::Duration::from_secs(initial_wait_secs)).await;
+        let mut max_balance = rust_decimal::Decimal::ZERO;
+        let mut last_error = None;
+        for attempt in 1..=max_attempts {
+            if attempt > 1 {
+                tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+            }
+            match self.check_balance_only(token_id).await {
+                Ok(b) => {
+                    if b > max_balance {
+                        max_balance = b;
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    log::debug!("Balance check attempt {}/{} failed: {}", attempt, max_attempts, last_error.as_ref().unwrap());
+                }
+            }
+        }
+        if max_balance > rust_decimal::Decimal::ZERO {
+            Ok(max_balance)
+        } else if let Some(e) = last_error {
+            Err(anyhow::anyhow!("Balance check failed after {} attempts: {}", max_attempts, e))
+        } else {
+            Ok(max_balance)
+        }
+    }
+
     /// Check token balance and allowance before selling
     /// Returns (balance, allowance) as Decimal values
     pub async fn check_balance_allowance(&self, token_id: &str) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal)> {
-        // Check if we have a private key (required for signing)
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for balance check. Please set private_key in config.json"))?;
-        
-        // Create signer from private key
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
-        
-        // Build authentication builder with proxy wallet support
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
-            auth_builder = auth_builder.funder(funder_address);
-            
-            // Set signature type based on config
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) => {
-                    anyhow::bail!(
-                        "Invalid configuration: proxy_wallet_address is set but signature_type is 0 (EOA).\n\
-                        For proxy wallets, use signature_type: 1 (POLY_PROXY) or 2 (GNOSIS_SAFE)."
-                    );
-                },
-                None => {
-                    eprintln!("⚠️  Using default signature type POLY_PROXY (1) for proxy wallet.");
-                    SignatureType::Proxy
-                },
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        // Create CLOB client with authentication
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate with CLOB API for balance check")?;
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for balance/allowance check")?;
         
         // Get balance and allowance using SDK
         // The SDK requires a BalanceAllowanceRequest built with builder pattern
@@ -1089,22 +1034,6 @@ impl PolymarketApi {
             .ok_or_else(|| anyhow::anyhow!("Failed to get contract config"))?;
         let exchange_address = config.exchange;
         
-        // Allowances is a HashMap<Address, String> - check all allowances and find the Exchange contract
-        // Log all allowances for debugging
-        eprintln!("   🔍 Checking allowances for {} contracts:", balance_allowance.allowances.len());
-        for (addr, allowance_str) in &balance_allowance.allowances {
-            let allowance_val = rust_decimal::Decimal::from_str(allowance_str)
-                .unwrap_or(rust_decimal::Decimal::ZERO);
-            let allowance_f64 = f64::try_from(allowance_val / rust_decimal::Decimal::from(1_000_000u64))
-                .unwrap_or(0.0);
-            let is_exchange = *addr == exchange_address;
-            eprintln!("      {}: {:.6} shares {}", 
-                if is_exchange { "✅ Exchange" } else { "   Other" },
-                allowance_f64,
-                if is_exchange { format!("(matches Exchange: {:#x})", exchange_address) } else { format!("({:#x})", addr) }
-            );
-        }
-        
         // Get allowance for the Exchange contract specifically
         let allowance = balance_allowance.allowances
             .get(&exchange_address)
@@ -1117,30 +1046,7 @@ impl PolymarketApi {
                     .and_then(|v| rust_decimal::Decimal::from_str(v).ok())
                     .unwrap_or(rust_decimal::Decimal::ZERO)
             });
-        
-        // Also check setApprovalForAll status
-        let is_approved_for_all = match self.check_is_approved_for_all().await {
-            Ok(true) => {
-                eprintln!("   ✅ setApprovalForAll: SET (Exchange can spend all tokens)");
-                true
-            }
-            Ok(false) => {
-                eprintln!("   ❌ setApprovalForAll: NOT SET (Exchange cannot spend tokens)");
-                false
-            }
-            Err(e) => {
-                eprintln!("   ⚠️  Could not check setApprovalForAll: {}", e);
-                false
-            }
-        };
-        
-        // If setApprovalForAll is set, individual token allowance doesn't matter
-        if is_approved_for_all {
-            eprintln!("   💡 Note: setApprovalForAll is SET - individual token allowance ({:.6}) doesn't matter for selling",
-                f64::try_from(allowance / rust_decimal::Decimal::from(1_000_000u64)).unwrap_or(0.0)
-            );
-        }
-        
+
         Ok((balance, allowance))
     }
 
@@ -1154,42 +1060,8 @@ impl PolymarketApi {
     /// 
     /// Call this right before place_market_order(..., "SELL", ...) for the token you're selling.
     pub async fn update_balance_allowance_for_sell(&self, token_id: &str) -> Result<()> {
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required. Please set private_key in config.json"))?;
-        
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key")?
-            .with_chain_id(Some(POLYGON));
-        
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}", proxy_addr))?;
-            auth_builder = auth_builder.funder(funder_address);
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) => anyhow::bail!("proxy_wallet_address set but signature_type is 0 (EOA)"),
-                None => SignatureType::Proxy,
-                Some(n) => anyhow::bail!("Invalid signature_type: {}", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate for update_balance_allowance")?;
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for update_balance_allowance")?;
         
         use polymarket_client_sdk::clob::types::request::UpdateBalanceAllowanceRequest;
         use polymarket_client_sdk::clob::types::AssetType;
@@ -1462,12 +1334,11 @@ impl PolymarketApi {
         
         eprintln!("   📤 Sending setApprovalForAll transaction via relayer (POST /submit)...");
         
-        // Build transaction for relayer
-        // NOTE: This simple format works for POLY_PROXY (type 1). For GNOSIS_SAFE (type 2),
-        // the relayer may expect: { from, to, proxyWallet, data, nonce, signature, signatureParams, type: "SAFE", metadata }
+        // Build transaction for relayer (matches SafeTransaction: to, operation=Call, data, value)
         let ctf_address_str = format!("{:#x}", ctf_contract_address);
         let transaction = serde_json::json!({
             "to": ctf_address_str,
+            "operation": 0u8,   // 0 = Call
             "data": call_data_hex,
             "value": "0"
         });
@@ -1485,52 +1356,29 @@ impl PolymarketApi {
         let api_passphrase = self.api_passphrase.as_ref()
             .ok_or_else(|| anyhow::anyhow!("API passphrase required for relayer. Please set api_passphrase in config.json"))?;
         
-        let timestamp = std::time::SystemTime::now()
+        let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs()
-            .to_string();
+            .as_millis() as u64;
+        let timestamp_str = timestamp_ms.to_string();
         
         let body_string = serde_json::to_string(&relayer_request)
             .context("Failed to serialize relayer request")?;
         
-        // Generate HMAC signature for relayer authentication. Path must match the
-        // endpoint: /submit (builder-relayer-client uses /submit, not /execute).
-        let url_path = "/submit";
-        let message = format!("POST{}{}{}", url_path, body_string, timestamp);
-        
-        // Try to decode secret from base64url first (Builder API uses base64url encoding)
-        // Base64url uses - and _ instead of + and /, making it URL-safe
-        // Then try standard base64, then fall back to raw bytes
-        let secret_bytes = {
-            use base64::engine::general_purpose;
-            use base64::Engine;
-            
-            // First try base64url (URL_SAFE engine)
-            if let Ok(bytes) = general_purpose::URL_SAFE.decode(api_secret) {
-                bytes
-            }
-            // Then try standard base64
-            else if let Ok(bytes) = general_purpose::STANDARD.decode(api_secret) {
-                bytes
-            }
-            // Finally, use raw bytes if both fail
-            else {
-                api_secret.as_bytes().to_vec()
-            }
-        };
-        
-        let mut mac = HmacSha256::new_from_slice(&secret_bytes)
-            .context("Failed to create HMAC")?;
-        mac.update(message.as_bytes());
-        let signature = hex::encode(mac.finalize().into_bytes());
+        let signature = Self::builder_relayer_signature(
+            api_secret,
+            timestamp_ms,
+            "POST",
+            "/submit",
+            &body_string,
+        )?;
         
         // Send request to relayer
         let response = self.client
             .post(RELAYER_SUBMIT)
             .header("User-Agent", "polymarket-trading-bot/1.0")
             .header("POLY_BUILDER_API_KEY", api_key)
-            .header("POLY_BUILDER_TIMESTAMP", &timestamp)
+            .header("POLY_BUILDER_TIMESTAMP", &timestamp_str)
             .header("POLY_BUILDER_PASSPHRASE", api_passphrase)
             .header("POLY_BUILDER_SIGNATURE", &signature)
             .header("Content-Type", "application/json")
@@ -1589,7 +1437,95 @@ impl PolymarketApi {
         
         Ok(())
     }
-    
+
+    /// Submit a signed Safe redeem transaction via Polymarket relayer (API).
+    /// Uses POST /submit with type=SAFE. On success returns RedeemResponse with transaction hash.
+    /// See: https://docs.polymarket.com/api-reference/relayer/submit-a-transaction
+    async fn submit_safe_redeem_via_relayer(
+        &self,
+        from_address: AlloyAddress,
+        safe_address_str: &str,
+        exec_calldata: &[u8],
+        nonce: U256,
+        safe_sig_bytes: &[u8],
+        safe_tx_gas: u64,
+    ) -> Result<crate::models::RedeemResponse> {
+        const RELAYER_SUBMIT: &str = "https://relayer-v2.polymarket.com/submit";
+        let api_key = self.api_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("API key required for relayer"))?;
+        let api_secret = self.api_secret.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("API secret required for relayer"))?;
+        let api_passphrase = self.api_passphrase.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("API passphrase required for relayer"))?;
+
+        // Relayer expects lowercase addresses and string values for all fields (per API docs)
+        let to_lower = |s: &str| s.strip_prefix("0x").map(|h| format!("0x{}", h.to_lowercase())).unwrap_or_else(|| s.to_lowercase());
+        let from_hex = format!("0x{}", hex::encode(from_address.as_slice()));
+        let to_hex = to_lower(safe_address_str);
+        let signature_params = serde_json::json!({
+            "gasPrice": "0",
+            "operation": "0",
+            "safeTxnGas": safe_tx_gas.to_string(),
+            "baseGas": "0",
+            "gasToken": "0x0000000000000000000000000000000000000000",
+            "refundReceiver": "0x0000000000000000000000000000000000000000"
+        });
+        let relayer_body = serde_json::json!({
+            "from": from_hex.to_lowercase(),
+            "to": to_hex,
+            "proxyWallet": to_hex,
+            "data": format!("0x{}", hex::encode(exec_calldata)),
+            "nonce": nonce.to_string(),
+            "signature": format!("0x{}", hex::encode(safe_sig_bytes)),
+            "signatureParams": signature_params,
+            "type": "SAFE"
+        });
+        let body_string = serde_json::to_string(&relayer_body)
+            .context("Serialize relayer body")?;
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let signature = Self::builder_relayer_signature(
+            api_secret,
+            timestamp_ms,
+            "POST",
+            "/submit",
+            &body_string,
+        )?;
+
+        eprintln!("   📤 Submitting Safe redeem via Polymarket relayer (API)...");
+        let response = self.client
+            .post(RELAYER_SUBMIT)
+            .header("User-Agent", "polymarket-trading-bot/1.0")
+            .header("POLY_BUILDER_API_KEY", api_key)
+            .header("POLY_BUILDER_TIMESTAMP", timestamp_ms.to_string())
+            .header("POLY_BUILDER_PASSPHRASE", api_passphrase)
+            .header("POLY_BUILDER_SIGNATURE", &signature)
+            .header("Content-Type", "application/json")
+            .json(&relayer_body)
+            .send()
+            .await
+            .context("Relayer submit request")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("Relayer response body")?;
+        if !status.is_success() {
+            anyhow::bail!("Relayer rejected redeem (status {}): {}", status, response_text);
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&response_text).context("Parse relayer JSON")?;
+        let transaction_id = parsed["transactionID"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing transactionID in relayer response"))?;
+        eprintln!("   ✅ Relayer accepted transaction ID: {}", transaction_id);
+        let tx_hash = self.wait_for_relayer_transaction(transaction_id).await?;
+        Ok(crate::models::RedeemResponse {
+            success: true,
+            message: Some(format!("Redeem submitted via Polymarket relayer. Tx: {}", tx_hash)),
+            transaction_hash: Some(tx_hash),
+            amount_redeemed: None,
+        })
+    }
+
     /// Wait for relayer transaction to be confirmed (like TypeScript SDK's response.wait())
     /// Polls the relayer status endpoint until transaction reaches STATE_CONFIRMED or STATE_FAILED
     async fn wait_for_relayer_transaction(&self, transaction_id: &str) -> Result<String> {
@@ -1777,63 +1713,13 @@ impl PolymarketApi {
         side: &str,
         order_type: Option<&str>, // "FOK" or "FAK", defaults to FOK
     ) -> Result<OrderResponse> {
-        // Check if we have a private key (required for signing)
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for market order")?;
         let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
-        
-        // Create signer from private key
+            .ok_or_else(|| anyhow::anyhow!("Private key required for order signing"))?;
         let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
+            .context("Failed to create signer from private key")?
             .with_chain_id(Some(POLYGON));
-        
-        // Build authentication builder with proxy wallet support
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        // Configure proxy wallet if provided
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
-            auth_builder = auth_builder.funder(funder_address);
-            
-            // Set signature type based on config or default to Proxy
-            // IMPORTANT: The signature type must match what was used when deriving API credentials
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) => {
-                    anyhow::bail!(
-                        "Invalid configuration: proxy_wallet_address is set but signature_type is 0 (EOA).\n\
-                        For proxy wallets, use signature_type: 1 (POLY_PROXY) for Magic Link/Google login, or 2 (GNOSIS_SAFE) for browser wallet."
-                    );
-                },
-                None => {
-                    // Default to Proxy when proxy wallet is set, but warn user
-                    eprintln!("⚠️  Using default signature type POLY_PROXY (1) for proxy wallet.");
-                    eprintln!("   If you get 'invalid signature' errors, ensure your API credentials were derived with signature type 1.");
-                    SignatureType::Proxy
-                },
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            // If signature type is set but no proxy wallet, validate it's EOA
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        // Create CLOB client with authentication (equivalent to: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress))
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
         
         // Convert order side string to SDK Side enum
         let side_enum = match side {
@@ -1870,17 +1756,13 @@ impl PolymarketApi {
         
         // For BUY orders, check USDC balance and allowance before placing order
         if matches!(side_enum, Side::Buy) {
-            eprintln!("🔍 Checking USDC balance and allowance before BUY order...");
             match self.check_usdc_balance_allowance().await {
                 Ok((usdc_balance, usdc_allowance)) => {
                     let usdc_balance_f64 = f64::try_from(usdc_balance / rust_decimal::Decimal::from(1_000_000u64)).unwrap_or(0.0);
                     let usdc_allowance_f64 = f64::try_from(usdc_allowance / rust_decimal::Decimal::from(1_000_000u64)).unwrap_or(0.0);
-                    
-                    eprintln!("   USDC Balance: ${:.2}", usdc_balance_f64);
-                    eprintln!("   USDC Allowance: ${:.2}", usdc_allowance_f64);
-                    eprintln!("   Order Amount: ${:.2}", amount_decimal);
-                    
-                    if usdc_balance_f64 < f64::try_from(amount_decimal).unwrap_or(0.0) {
+                    let order_f64 = f64::try_from(amount_decimal).unwrap_or(0.0);
+                    eprintln!("   USDC: ${:.2} balance, ${:.2} needed", usdc_balance_f64, order_f64);
+                    if usdc_balance_f64 < order_f64 {
                         anyhow::bail!(
                             "Insufficient USDC balance for BUY order.\n\
                             Required: ${:.2}, Available: ${:.2}\n\
@@ -1889,21 +1771,15 @@ impl PolymarketApi {
                             self.proxy_wallet_address.as_deref().unwrap_or("your wallet")
                         );
                     }
-                    
-                    if usdc_allowance_f64 < f64::try_from(amount_decimal).unwrap_or(0.0) {
-                        eprintln!("   ⚠️  USDC allowance (${:.2}) is less than order amount (${:.2})", usdc_allowance_f64, amount_decimal);
-                        eprintln!("   💡 The SDK should auto-approve USDC on first attempt, but if this fails, you may need to approve USDC manually.");
-                        eprintln!("   💡 Run: cargo run --bin test_allowance -- --check (to check USDC approval status)");
+                    if usdc_allowance_f64 < order_f64 {
+                        eprintln!("   ⚠️  Allowance ${:.2} < order (SDK may auto-approve)", usdc_allowance_f64);
                     }
                 }
                 Err(e) => {
-                    eprintln!("   ⚠️  Could not check USDC balance/allowance: {} (continuing anyway)", e);
+                    eprintln!("   ⚠️  USDC check failed: {} (continuing)", e);
                 }
             }
         }
-        
-        eprintln!("📤 Creating and posting MARKET order: {} {:.2} {} (type: {:?})", 
-              side, amount_decimal, token_id, order_type_enum);
         
         // Use actual market order (not limit order)
         // Market orders don't require a price - they execute at the best available market price
@@ -1994,13 +1870,20 @@ impl PolymarketApi {
                     
                     retry_count += 1;
                     
-                    // Log the error details
-                    eprintln!("❌ Failed to post market order (attempt {}/{}). Error details: {:?}", retry_count, max_retries, e);
-                    eprintln!("   Order details:");
-                    eprintln!("      Token ID: {}", token_id);
-                    eprintln!("      Side: {}", side);
-                    eprintln!("      Amount: ${}", amount_decimal);
-                    eprintln!("      Type: {:?} (Market order - price determined by market)", order_type_enum);
+                    // Single concise log line (avoid verbose repetition; caller will log context)
+                    let short_msg = if error_str.contains("no orders found to match") || error_str.contains("FAK order") {
+                        "FAK: no liquidity to match"
+                    } else if error_str.contains("FOK") || error_str.contains("fully filled") {
+                        "FOK: could not fill"
+                    } else if is_balance_error {
+                        "Insufficient balance"
+                    } else if is_allowance_error {
+                        "Allowance issue"
+                    } else {
+                        error_str.lines().next().unwrap_or("Order rejected").trim()
+                    };
+                    let token_short = if token_id.len() > 16 { format!("{}…", &token_id[..16]) } else { token_id.to_string() };
+                    eprintln!("❌ Order failed: {} | {} ${} token:{}", short_msg, side, amount_decimal, token_short);
                     
                     // Only retry for allowance errors on SELL orders (not balance errors)
                     // Balance errors mean you don't have the tokens - retrying won't help
@@ -2125,9 +2008,86 @@ impl PolymarketApi {
             },
         };
         
-            eprintln!("✅ Market order executed successfully! Order ID: {}", response.order_id);
+            eprintln!("   ✅ Posted | Order {}", response.order_id);
         
         Ok(order_response)
+    }
+
+    /// Place multiple market orders in a single API request (batch).
+    /// Returns one response per order in the same order. Each item may be Ok or Err depending on that order's success.
+    /// Confirmation time is one round-trip for the whole batch.
+    pub async fn place_market_orders(
+        &self,
+        orders: &[(&str, f64, &str, Option<&str>)], // (token_id, amount, side, order_type)
+    ) -> Result<Vec<OrderResponse>> {
+        if orders.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.get_or_create_clob_client().await
+            .context("Failed to get CLOB client for place_market_orders")?;
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing."))?;
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key")?
+            .with_chain_id(Some(POLYGON));
+        use rust_decimal::Decimal;
+        use rust_decimal::prelude::*;
+        use rust_decimal::RoundingStrategy;
+        let mut signed_orders = Vec::with_capacity(orders.len());
+        for (token_id, amount, side, order_type) in orders.iter() {
+            let side_enum = match *side {
+                "BUY" => Side::Buy,
+                "SELL" => Side::Sell,
+                _ => anyhow::bail!("Invalid order side: {}", side),
+            };
+            let order_type_enum = match order_type.unwrap_or("FOK") {
+                "FOK" => OrderType::FOK,
+                "FAK" => OrderType::FAK,
+                _ => OrderType::FOK,
+            };
+            let amount_decimal = if matches!(side_enum, Side::Buy) {
+                Decimal::from_f64_retain(*amount)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal"))?
+                    .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
+            } else {
+                let shares_str = format!("{:.2}", amount);
+                Decimal::from_str(&shares_str).context("Parse shares")?
+            };
+            let amount_typed = if matches!(side_enum, Side::Buy) {
+                Amount::usdc(amount_decimal).context("Amount::usdc")?
+            } else {
+                Amount::shares(amount_decimal).context("Amount::shares")?
+            };
+            let order_to_sign = client
+                .market_order()
+                .token_id(*token_id)
+                .amount(amount_typed)
+                .side(side_enum)
+                .order_type(order_type_enum)
+                .build()
+                .await?;
+            let signed = client.sign(&signer, order_to_sign).await?;
+            signed_orders.push(signed);
+        }
+        let responses = client.post_orders(signed_orders).await
+            .context("Failed to post batch orders")?;
+        let mut out = Vec::with_capacity(responses.len());
+        for (i, resp) in responses.into_iter().enumerate() {
+            let token_id = orders.get(i).map(|o| o.0).unwrap_or("?");
+            out.push(OrderResponse {
+                order_id: Some(resp.order_id.clone()),
+                status: resp.status.to_string(),
+                message: if resp.success {
+                    Some(format!("Order ID: {}", resp.order_id))
+                } else {
+                    resp.error_msg.clone()
+                },
+            });
+            if !resp.success {
+                eprintln!("   Order {} (token {}...) rejected: {}", i + 1, &token_id[..token_id.len().min(16)], resp.error_msg.as_deref().unwrap_or("unknown"));
+            }
+        }
+        Ok(out)
     }
     
     /// Place an order using REST API with HMAC authentication (fallback method)
@@ -2181,9 +2141,89 @@ impl PolymarketApi {
         Ok(order_response)
     }
 
+    /// True if API credentials (api_key, api_secret, api_passphrase) are set. Required for CLOB-authenticated calls (e.g. balance check, portfolio scan fallback).
+    pub fn has_api_credentials(&self) -> bool {
+        self.api_key.is_some() && self.api_secret.is_some() && self.api_passphrase.is_some()
+    }
+
+    /// Return the wallet address to use for positions/redemption: proxy_wallet_address if set, else EOA from private_key.
+    pub fn get_wallet_address(&self) -> Result<String> {
+        if let Some(ref proxy) = self.proxy_wallet_address {
+            return Ok(proxy.clone());
+        }
+        let pk = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("private_key required to get wallet address"))?;
+        let signer = LocalSigner::from_str(pk)
+            .context("Invalid private_key")?;
+        Ok(format!("{}", signer.address()))
+    }
+
+    /// Fetch redeemable position condition IDs from Data API (user=wallet, redeemable=true).
+    /// Only includes positions where the wallet holds tokens (size > 0).
+    pub async fn get_redeemable_positions(&self, wallet: &str) -> Result<Vec<String>> {
+        let url = "https://data-api.polymarket.com/positions";
+        let user = if wallet.starts_with("0x") {
+            wallet.to_string()
+        } else {
+            format!("0x{}", wallet)
+        };
+        let response = self.client
+            .get(url)
+            .query(&[("user", user.as_str()), ("redeemable", "true"), ("limit", "500")])
+            .send()
+            .await
+            .context("Failed to fetch redeemable positions")?;
+        if !response.status().is_success() {
+            anyhow::bail!("Data API returned {} for redeemable positions", response.status());
+        }
+        let positions: Vec<Value> = response.json().await.unwrap_or_default();
+        let mut condition_ids: Vec<String> = positions
+            .iter()
+            .filter(|p| {
+                let size = p.get("size")
+                    .and_then(|s| s.as_f64())
+                    .or_else(|| p.get("size").and_then(|s| s.as_u64().map(|u| u as f64)))
+                    .or_else(|| p.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()));
+                size.map(|s| s > 0.0).unwrap_or(false)
+            })
+            .filter_map(|p| p.get("conditionId").and_then(|c| c.as_str()).map(|s| {
+                if s.starts_with("0x") { s.to_string() } else { format!("0x{}", s) }
+            }))
+            .collect();
+        condition_ids.sort();
+        condition_ids.dedup();
+        Ok(condition_ids)
+    }
+
     /// Redeem winning conditional tokens after market resolution
     /// 
     /// This uses the CTF (Conditional Token Framework) contract to redeem winning tokens
+    /// Derive the Gnosis Safe (proxy wallet) address for Polygon from the EOA signer.
+    /// Matches TypeScript deriveSafe: getCreate2Address(factory, salt, initCodeHash).
+    /// Constants from builder-relayer-client: SafeFactory, SAFE_INIT_CODE_HASH.
+    fn derive_safe_address_polygon(eoa: &AlloyAddress) -> AlloyAddress {
+        const SAFE_FACTORY_POLYGON: [u8; 20] = [
+            0xaa, 0xcf, 0xee, 0xa0, 0x3e, 0xb1, 0x56, 0x1c, 0x4e, 0x67,
+            0xd6, 0x61, 0xe4, 0x06, 0x82, 0xbd, 0x20, 0xe3, 0x54, 0x1b,
+        ];
+        const SAFE_INIT_CODE_HASH: [u8; 32] = [
+            0x2b, 0xce, 0x21, 0x27, 0xff, 0x07, 0xfb, 0x63, 0x2d, 0x16, 0xc8, 0x34, 0x7c, 0x4e, 0xbf, 0x50,
+            0x1f, 0x48, 0x41, 0x16, 0x8b, 0xed, 0x00, 0xd9, 0xe6, 0xef, 0x71, 0x5d, 0xdb, 0x6f, 0xce, 0xcf,
+        ];
+        // Salt = keccak256(abi.encode(address)) — 32 bytes: 12 zero + 20 byte address
+        let mut salt_input = [0u8; 32];
+        salt_input[12..32].copy_from_slice(eoa.as_slice());
+        let salt = keccak256(salt_input);
+        // CREATE2: keccak256(0xff ++ deployer (20) ++ salt (32) ++ initCodeHash (32))[12..32]
+        let mut preimage = Vec::with_capacity(85);
+        preimage.push(0xff);
+        preimage.extend_from_slice(&SAFE_FACTORY_POLYGON);
+        preimage.extend_from_slice(salt.as_slice());
+        preimage.extend_from_slice(&SAFE_INIT_CODE_HASH);
+        let hash = keccak256(&preimage);
+        AlloyAddress::from_slice(&hash[12..32])
+    }
+
     /// for USDC at 1:1 ratio after market resolution.
     /// 
     /// Parameters:
@@ -2202,376 +2242,409 @@ impl PolymarketApi {
         token_id: &str,
         outcome: &str,
     ) -> Result<RedeemResponse> {
-        // Using Relayer Client for gasless transactions
-        // No need for private key signing - relayer handles it
-        // Based on docs: https://docs.polymarket.com/developers/builders/relayer-client#redeem-positions
-        
-        // USDC collateral token address on Polygon
-        let collateral_token = AlloyAddress::parse_checksummed(
-            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
-            None
-        ).context("Failed to parse USDC address")?;
-        
-        // Parse condition_id to B256 (remove 0x prefix if present)
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
+
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
+            .with_chain_id(Some(POLYGON));
+
+        let parse_address_hex = |s: &str| -> Result<AlloyAddress> {
+            let hex_str = s.strip_prefix("0x").unwrap_or(s);
+            let bytes = hex::decode(hex_str).context("Invalid hex in address")?;
+            let len = bytes.len();
+            let arr: [u8; 20] = bytes.try_into().map_err(|_| anyhow::anyhow!("Address must be 20 bytes, got {}", len))?;
+            Ok(AlloyAddress::from(arr))
+        };
+
+        let collateral_token = parse_address_hex("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+            .context("Failed to parse USDC address")?;
+
         let condition_id_clean = condition_id.strip_prefix("0x").unwrap_or(condition_id);
         let condition_id_b256 = B256::from_str(condition_id_clean)
-            .context(format!("Failed to parse condition_id to B256: {}", condition_id))?;
-        
-        // Determine index_sets based on the documentation
-        // According to Polymarket docs: pass [1, 2] for binary markets
-        // The contract will only redeem winning tokens (only winners pay out)
-        // So even if we pass both, only the winning outcome will be redeemed
-        let index_sets = vec![U256::from(1), U256::from(2)]; // Pass both [1, 2] as per docs
-        
-        eprintln!("🔄 Redeeming tokens for condition {} (outcome: {})", condition_id, outcome);
-        eprintln!("   📋 Passing index_sets: [1, 2] (contract will only redeem winning tokens)");
-        
-        // Use Relayer Client for gasless transactions. The /execute path returns 404;
-        // builder-relayer-client uses POST /submit. See: Polymarket/builder-relayer-client
-        // CTF contract: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
-        // Function: redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)
-        
-        const CTF_CONTRACT: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
-        const RELAYER_SUBMIT: &str = "https://relayer-v2.polymarket.com/submit";
-        
-        let relayer_url = RELAYER_SUBMIT;
-        
-        // Parse CTF contract address using AlloyAddress
-        // Use parse instead of parse_checksummed to avoid checksum validation issues
-        eprintln!("   🔍 Parsing CTF contract address: {}", CTF_CONTRACT);
-        let ctf_address = CTF_CONTRACT.strip_prefix("0x")
-            .and_then(|s| {
-                eprintln!("   🔍 Decoding hex: {}", s);
-                hex::decode(s).ok()
-            })
-            .and_then(|bytes| {
-                eprintln!("   🔍 Decoded bytes length: {}", bytes.len());
-                if bytes.len() == 20 {
-                    Some(AlloyAddress::from_slice(&bytes))
-                } else {
-                    eprintln!("   ⚠️  Invalid address length: {} (expected 20)", bytes.len());
-                    None
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("Invalid CTF contract address format: {}", CTF_CONTRACT))
+            .context(format!("Failed to parse condition_id as B256: {}", condition_id))?;
+
+        let index_set = if outcome.to_uppercase().contains("UP") || outcome == "1" {
+            U256::from(1)
+        } else {
+            U256::from(2)
+        };
+
+        eprintln!("Redeeming winning tokens for condition {} (outcome: {}, index_set: {})",
+              condition_id, outcome, index_set);
+
+        const CTF_CONTRACT: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
+        // Use alternate public RPC to avoid 401/API key disabled from polygon-rpc.com
+        const RPC_URL: &str = "https://polygon-bor-rpc.publicnode.com";
+        const PROXY_WALLET_FACTORY: &str = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052";
+
+        let ctf_address = parse_address_hex(CTF_CONTRACT)
             .context("Failed to parse CTF contract address")?;
-        eprintln!("   ✅ Successfully parsed CTF address: {:#x}", ctf_address);
-        
+
         let parent_collection_id = B256::ZERO;
-        
+        let use_proxy = self.proxy_wallet_address.is_some();
+        let sig_type = self.signature_type.unwrap_or(1);
+        let index_sets: Vec<U256> = vec![index_set];
         eprintln!("   Prepared redemption parameters:");
         eprintln!("   - CTF Contract: {}", ctf_address);
         eprintln!("   - Collateral token (USDC): {}", collateral_token);
         eprintln!("   - Condition ID: {} ({:?})", condition_id, condition_id_b256);
-        eprintln!("   - Index sets: [1, 2] (contract will only redeem winning tokens)");
-        eprintln!("   - Outcome: {}", outcome);
-        
-        // Encode the redeemPositions function call
-        // Function signature: redeemPositions(address,bytes32,bytes32,uint256[])
-        // Function selector: keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[0:4] = 0x3d7d3f5a
-        
-        // Function selector
-        let function_selector = hex::decode("3d7d3f5a")
-            .context("Failed to decode function selector")?;
-        
-        // Encode parameters manually using ABI encoding rules
-        // Parameters: (address, bytes32, bytes32, uint256[])
-        let mut encoded_params = Vec::new();
-        
-        // Encode address (20 bytes, left-padded to 32 bytes)
-        let mut addr_bytes = [0u8; 32];
-        addr_bytes[12..].copy_from_slice(collateral_token.as_slice());
-        encoded_params.extend_from_slice(&addr_bytes);
-        
-        // Encode parentCollectionId (bytes32)
-        encoded_params.extend_from_slice(parent_collection_id.as_slice());
-        
-        // Encode conditionId (bytes32)
-        encoded_params.extend_from_slice(condition_id_b256.as_slice());
-        
-        // Encode indexSets array: offset (32 bytes) + length (32 bytes) + data (32 bytes per element)
-        // Offset points to where array data starts (after all fixed params + offset itself)
-        // Fixed params: address (32) + bytes32 (32) + bytes32 (32) + offset (32) = 128 bytes
-        let array_offset = 32 * 4; // offset to array data (3 fixed params + 1 offset param)
-        let array_length = index_sets.len();
-        
-        // Offset to array data (32 bytes)
-        let offset_bytes = U256::from(array_offset).to_be_bytes::<32>();
-        encoded_params.extend_from_slice(&offset_bytes);
-        
-        // Now append array data after all fixed parameters
-        // Array length (32 bytes)
-        let length_bytes = U256::from(array_length).to_be_bytes::<32>();
-        encoded_params.extend_from_slice(&length_bytes);
-        
-        // Array data (each uint256 is 32 bytes)
-        for idx in &index_sets {
-            let idx_bytes = idx.to_be_bytes::<32>();
-            encoded_params.extend_from_slice(&idx_bytes);
+        eprintln!("   - Index set(s): {:?} (outcome: {})", index_sets, outcome);
+
+        // Pre-check: condition must be resolved on-chain (payoutDenominator > 0)
+        let provider_resolution = ProviderBuilder::new().connect(RPC_URL).await.ok();
+        if let Some(prov) = &provider_resolution {
+            let payout_denom_selector = keccak256("payoutDenominator(bytes32)".as_bytes()).as_slice()[..4].to_vec();
+            let mut payout_calldata = Vec::with_capacity(4 + 32);
+            payout_calldata.extend_from_slice(&payout_denom_selector);
+            payout_calldata.extend_from_slice(condition_id_b256.as_slice());
+            let payout_tx = TransactionRequest::default()
+                .to(ctf_address)
+                .input(Bytes::from(payout_calldata).into());
+            if let Ok(res) = prov.call(payout_tx).await {
+                let arr: [u8; 32] = res.as_ref().try_into().unwrap_or([0u8; 32]);
+                let denom = U256::from_be_slice(&arr);
+                if denom == U256::ZERO {
+                    anyhow::bail!(
+                        "Condition {} is not resolved on-chain yet (payoutDenominator=0). \
+                        Wait for the oracle to report the outcome, then try again.",
+                        &condition_id[..condition_id.len().min(18)]
+                    );
+                }
+                eprintln!("   Condition resolved on-chain (payoutDenominator={})", denom);
+            }
         }
-        
-        // Combine function selector with encoded parameters
-        let mut call_data = function_selector;
-        call_data.extend_from_slice(&encoded_params);
-        let call_data_hex = format!("0x{}", hex::encode(&call_data));
-        
-        eprintln!("   Using Relayer Client for gasless redemption...");
-        eprintln!("   Relayer URL: {}", relayer_url);
-        
-        // Build transaction for relayer
-        // Relayer expects: { transactions: [{ to, data, value }], description }
-        let ctf_address_str = format!("{:#x}", ctf_address);
-        let transaction = serde_json::json!({
-            "to": ctf_address_str,
-            "data": call_data_hex,
-            "value": "0"
-        });
-        
-        let relayer_request = serde_json::json!({
-            "transactions": [transaction],
-            "description": format!("Redeem {} token for condition {}", outcome, condition_id)
-        });
-        
-        // Add authentication headers (Builder API credentials)
-        let api_key = self.api_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("API key required for relayer. Please set api_key in config.json"))?;
-        let api_secret = self.api_secret.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("API secret required for relayer. Please set api_secret in config.json"))?;
-        let api_passphrase = self.api_passphrase.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("API passphrase required for relayer. Please set api_passphrase in config.json"))?;
-        
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        
-        let body_string = serde_json::to_string(&relayer_request)
-            .context("Failed to serialize relayer request")?;
-        
-        // Generate HMAC signature for relayer authentication
-        // Message format: POST + /submit + body + timestamp
-        // This must match exactly what the relayer expects
-        let url_path = "/submit";
-        let message = format!("POST{}{}{}", url_path, body_string, timestamp);
-        
-        // Try to decode secret from base64url first (Builder API uses base64url encoding)
-        // Base64url uses - and _ instead of + and /, making it URL-safe
-        // Then try standard base64, then fall back to raw bytes
-        let secret_bytes = {
-            use base64::engine::general_purpose;
-            use base64::Engine;
-            
-            // First try base64url (URL_SAFE engine)
-            if let Ok(bytes) = general_purpose::URL_SAFE.decode(api_secret) {
-                bytes
+
+        // Manual ABI encode for redeemPositions(address,bytes32,bytes32,uint256[])
+        let selector = hex::decode("3d7d3f5a").context("redeemPositions selector")?;
+        let build_redeem_calldata = |index_list: &[U256]| -> Vec<u8> {
+            let mut calldata = Vec::new();
+            calldata.extend_from_slice(&selector);
+            let mut addr_bytes = [0u8; 32];
+            addr_bytes[12..].copy_from_slice(collateral_token.as_slice());
+            calldata.extend_from_slice(&addr_bytes);
+            calldata.extend_from_slice(parent_collection_id.as_slice());
+            calldata.extend_from_slice(condition_id_b256.as_slice());
+            calldata.extend_from_slice(&U256::from(32u32 * 4).to_be_bytes::<32>());
+            calldata.extend_from_slice(&U256::from(index_list.len()).to_be_bytes::<32>());
+            for idx in index_list {
+                calldata.extend_from_slice(&idx.to_be_bytes::<32>());
             }
-            // Then try standard base64
-            else if let Ok(bytes) = general_purpose::STANDARD.decode(api_secret) {
-                bytes
-            }
-            // Finally, use raw bytes if both fail
-            else {
-                api_secret.as_bytes().to_vec()
-            }
+            calldata
         };
-        
-        let mut mac = HmacSha256::new_from_slice(&secret_bytes)
-            .context("Failed to create HMAC from API secret")?;
-        mac.update(message.as_bytes());
-        let signature = hex::encode(mac.finalize().into_bytes());
-        
-        // Send request to relayer
-        // CRITICAL: Use .body() with the exact same body_string used for HMAC
-        // This ensures the request body matches exactly what was signed
-        let response = self.client
-            .post(relayer_url)
-            .header("User-Agent", "polymarket-trading-bot/1.0")
-            .header("POLY_BUILDER_API_KEY", api_key)
-            .header("POLY_BUILDER_TIMESTAMP", &timestamp)
-            .header("POLY_BUILDER_PASSPHRASE", api_passphrase)
-            .header("POLY_BUILDER_SIGNATURE", &signature)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .body(body_string)  // Use the exact same body string used for HMAC
-            .send()
-            .await
-            .context("Failed to send redemption request to relayer")?;
-        
-        let status = response.status();
-        let response_text = response.text().await
-            .context("Failed to read relayer response")?;
-        
-        eprintln!("   📥 Relayer response status: {}", status);
-        eprintln!("   📥 Relayer response: {}", &response_text[..500.min(response_text.len())]);
-        
-        if !status.is_success() {
-            // Provide detailed error message for 401 Unauthorized
-            if status == 401 {
-                anyhow::bail!(
-                    "Relayer redemption failed: 401 Unauthorized - Invalid Builder API credentials\n\
-                    \n\
-                    This error means your Builder API credentials are incorrect or missing.\n\
-                    \n\
-                    Please verify:\n\
-                    1. You're using Builder API credentials (not User API credentials)\n\
-                    2. Get Builder API credentials from: https://polymarket.com/builder\n\
-                    3. Your config.json has:\n\
-                       - api_key: Your Builder API key\n\
-                       - api_secret: Your Builder API secret (base64-encoded)\n\
-                       - api_passphrase: Your Builder API passphrase\n\
-                    4. The credentials match your Builder Profile exactly\n\
-                    5. Your Builder API credentials were derived with the correct signature_type ({})\n\
-                    \n\
-                    Response: {}",
-                    self.signature_type.unwrap_or(0),
-                    &response_text[..500.min(response_text.len())]
-                );
-            }
-            
-            anyhow::bail!(
-                "Relayer redemption failed (status {}): {}",
-                status, &response_text[..200.min(response_text.len())]
-            );
-        }
-        
-        // Parse relayer response
-        let relayer_response: serde_json::Value = serde_json::from_str(&response_text)
-            .context("Failed to parse relayer response")?;
-        
-        let transaction_id = relayer_response["transactionID"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing transactionID in relayer response"))?;
-        
-        eprintln!("   ✅ Relayer transaction submitted successfully");
-        eprintln!("   Transaction ID: {}", transaction_id);
-        eprintln!("   Waiting for transaction confirmation...");
-        
-        // Poll for transaction status
-        // Relayer states: STATE_NEW, STATE_EXECUTED, STATE_MINE, STATE_CONFIRMED, STATE_FAILED, STATE_INVALID
-        let status_url = format!("https://relayer-v2.polymarket.com/transaction/{}", transaction_id);
-        
-        // Poll for transaction confirmation (with timeout)
-        let max_wait_seconds = 120;
-        let check_interval_seconds = 2;
-        let start_time = std::time::Instant::now();
-        
-        loop {
-            let elapsed = start_time.elapsed().as_secs();
-            if elapsed >= max_wait_seconds {
-                eprintln!("   ⏱️  Timeout waiting for relayer confirmation ({}s) - will retry on next check", max_wait_seconds);
-                return Ok(RedeemResponse {
-                    success: false,
-                    message: Some(format!("Relayer transaction submitted (ID: {}), but confirmation timeout. Will retry.", transaction_id)),
-                    transaction_hash: Some(transaction_id.to_string()),
-                    amount_redeemed: None,
-                });
-            }
-            
-            // Generate new timestamp and signature for status check
-            let status_timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .to_string();
-            
-            let status_message = format!("GET{}{}", status_url, status_timestamp);
-            
-            // Try to decode secret from base64url first (Builder API uses base64url encoding)
-            // Base64url uses - and _ instead of + and /, making it URL-safe
-            // Then try standard base64, then fall back to raw bytes
-            let status_secret_bytes = {
-                use base64::engine::general_purpose;
-                use base64::Engine;
-                
-                // First try base64url (URL_SAFE engine)
-                if let Ok(bytes) = general_purpose::URL_SAFE.decode(api_secret) {
-                    bytes
-                }
-                // Then try standard base64
-                else if let Ok(bytes) = general_purpose::STANDARD.decode(api_secret) {
-                    bytes
-                }
-                // Finally, use raw bytes if both fail
-                else {
-                    api_secret.as_bytes().to_vec()
-                }
-            };
-            
-            let mut status_mac = HmacSha256::new_from_slice(&status_secret_bytes)
-                .context("Failed to create HMAC for status check")?;
-            status_mac.update(status_message.as_bytes());
-            let status_signature = hex::encode(status_mac.finalize().into_bytes());
-            
-            // Check transaction status
-            match self.client
-                .get(&status_url)
-                .header("POLY_BUILDER_API_KEY", api_key)
-                .header("POLY_BUILDER_TIMESTAMP", &status_timestamp)
-                .header("POLY_BUILDER_PASSPHRASE", api_passphrase)
-                .header("POLY_BUILDER_SIGNATURE", &status_signature)
-                .send()
+        let mut redeem_calldata = build_redeem_calldata(&index_sets);
+
+        // sig_type 2: proxy_wallet_address must be a Gnosis Safe (v1.3); it must have nonce(), getTransactionHash(), execTransaction()
+        let (tx_to, tx_data, gas_limit, used_safe_redemption) = if use_proxy && sig_type == 2 {
+            let safe_address_str = self.proxy_wallet_address.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("proxy_wallet_address required for Safe redemption"))?;
+            let safe_address = parse_address_hex(safe_address_str)
+                .context("Failed to parse proxy_wallet_address (Safe address)")?;
+            eprintln!("   Using Gnosis Safe (sig_type 2): signing and executing redemption via Safe.execTransaction");
+            let provider_read = ProviderBuilder::new()
+                .connect(RPC_URL)
                 .await
-            {
-                Ok(status_response) => {
-                    if status_response.status().is_success() {
-                        match status_response.json::<serde_json::Value>().await {
-                            Ok(status_data) => {
-                                let state = status_data["state"].as_str()
-                                    .unwrap_or("UNKNOWN");
-                                let tx_hash = status_data["transactionHash"].as_str();
-                                
-                                eprintln!("   Transaction state: {} (elapsed: {}s)", state, elapsed);
-                                
-                                match state {
-                                    "STATE_CONFIRMED" => {
-                                        let redeem_response = RedeemResponse {
-                                            success: true,
-                                            message: Some(format!("Successfully redeemed tokens via relayer. Transaction ID: {}", transaction_id)),
-                                            transaction_hash: tx_hash.map(|s| s.to_string()),
-                                            amount_redeemed: None,
-                                        };
-                                        
-                                        eprintln!("✅ Successfully redeemed tokens via Relayer Client!");
-                                        eprintln!("   Transaction ID: {}", transaction_id);
-                                        if let Some(hash) = tx_hash {
-                                            eprintln!("   Transaction hash: {}", hash);
-                                        }
-                                        
-                                        return Ok(redeem_response);
-                                    }
-                                    "STATE_FAILED" | "STATE_INVALID" => {
-                                        anyhow::bail!(
-                                            "Relayer redemption transaction failed (state: {}). Transaction ID: {}",
-                                            state, transaction_id
-                                        );
-                                    }
-                                    _ => {
-                                        // STATE_NEW, STATE_EXECUTED, STATE_MINE - still processing
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(check_interval_seconds)).await;
-                                        continue;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to parse status response: {} - will retry", e);
-                                tokio::time::sleep(tokio::time::Duration::from_secs(check_interval_seconds)).await;
-                                continue;
-                            }
+                .context("Failed to connect to RPC for Safe read calls")?;
+            // Pre-check: Safe on-chain balance. If 0, direct RPC redeem will revert; still try relayer when API credentials exist (custody flow).
+            if !token_id.is_empty() {
+                let balance_of_selector = keccak256("balanceOf(address,uint256)".as_bytes()).as_slice()[..4].to_vec();
+                let mut balance_calldata = Vec::with_capacity(4 + 32 + 32);
+                balance_calldata.extend_from_slice(&balance_of_selector);
+                let mut addr_padded = [0u8; 32];
+                addr_padded[12..].copy_from_slice(safe_address.as_slice());
+                balance_calldata.extend_from_slice(&addr_padded);
+                let token_id_u256 = U256::from_str(token_id).unwrap_or(U256::ZERO);
+                balance_calldata.extend_from_slice(&token_id_u256.to_be_bytes::<32>());
+                let balance_tx = TransactionRequest::default()
+                    .to(ctf_address)
+                    .input(Bytes::from(balance_calldata).into());
+                if let Ok(res) = provider_read.call(balance_tx).await {
+                    let arr: [u8; 32] = res.as_ref().try_into().unwrap_or([0u8; 32]);
+                    let balance = U256::from_be_slice(&arr);
+                    if balance == U256::ZERO {
+                        let has_relayer = self.api_key.is_some() && self.api_secret.is_some() && self.api_passphrase.is_some();
+                        if has_relayer {
+                            eprintln!("   ⚠️  Safe holds 0 of this token on-chain (Polymarket may custody it). Proceeding to try relayer (API) redeem.");
+                        } else {
+                            anyhow::bail!(
+                                "Your Safe ({}) holds 0 balance of this conditional token on-chain. \
+                                Set api_key, api_secret, and api_passphrase in config to attempt redeem via Polymarket relayer, or redeem at https://polymarket.com (Portfolio → Redeem).",
+                                safe_address_str
+                            );
                         }
                     } else {
-                        // Status check failed, wait and retry
-                        tokio::time::sleep(tokio::time::Duration::from_secs(check_interval_seconds)).await;
-                        continue;
+                        eprintln!("   Safe holds {} units of conditional token on-chain", balance);
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to check relayer status: {} - will retry", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(check_interval_seconds)).await;
-                    continue;
+            }
+            // Simulate CTF.redeemPositions as the Safe so we get the real revert reason (Safe.execTransaction does not revert on inner failure)
+            let sim_ctf = TransactionRequest::default()
+                .from(safe_address)
+                .to(ctf_address)
+                .input(Bytes::from(redeem_calldata.clone()).into())
+                .value(U256::ZERO);
+            if let Err(e) = provider_read.call(sim_ctf).await {
+                // For binary markets, try the other index set (Polymarket may map Up=2, Down=1)
+                let index_set_alt = if index_set == U256::ONE { U256::from(2) } else { U256::ONE };
+                let redeem_alt = build_redeem_calldata(&[index_set_alt]);
+                let sim_alt = TransactionRequest::default()
+                    .from(safe_address)
+                    .to(ctf_address)
+                    .input(Bytes::from(redeem_alt.clone()).into())
+                    .value(U256::ZERO);
+                if let Err(_) = provider_read.call(sim_alt).await {
+                    // Polymarket docs: redeem with [1, 2] for binary (both outcomes; only winning pays)
+                    let redeem_both = build_redeem_calldata(&[U256::ONE, U256::from(2)]);
+                    let sim_both = TransactionRequest::default()
+                        .from(safe_address)
+                        .to(ctf_address)
+                        .input(Bytes::from(redeem_both.clone()).into())
+                        .value(U256::ZERO);
+                    if let Err(_) = provider_read.call(sim_both).await {
+                        anyhow::bail!(
+                            "CTF redeem would revert (simulated as Safe): {}. \
+                            Tried index sets [{}], [{}], and [1,2]; all reverted. The CTF may not hold collateral for this market — redeem at https://polymarket.com (Portfolio → Redeem).",
+                            e, index_set, index_set_alt
+                        );
+                    }
+                    redeem_calldata = redeem_both;
+                    eprintln!("   Using index sets [1, 2] (single-index simulations reverted)");
+                } else {
+                    redeem_calldata = redeem_alt;
+                    eprintln!("   Using index set {} (simulation with {} reverted)", index_set_alt, index_set);
                 }
             }
+            let nonce_selector = keccak256("nonce()".as_bytes());
+            let nonce_calldata: Vec<u8> = nonce_selector.as_slice()[..4].to_vec();
+            let nonce_tx = TransactionRequest::default()
+                .to(safe_address)
+                .input(Bytes::from(nonce_calldata.clone()).into());
+            let nonce_result = match provider_read.call(nonce_tx).await {
+                Ok(r) => r,
+                Err(e) => {
+                    anyhow::bail!(
+                        "Safe.nonce() failed: {}. \
+                        For sig_type 2, proxy_wallet_address must be a Gnosis Safe (has nonce()). \
+                        If you use Polymarket proxy (Magic Link/Google), use signature_type: 1 in config.",
+                        e
+                    );
+                }
+            };
+            let nonce_bytes: [u8; 32] = nonce_result.as_ref().try_into()
+                .map_err(|_| anyhow::anyhow!("Safe.nonce() did not return 32 bytes"))?;
+            let nonce = U256::from_be_slice(&nonce_bytes);
+            const SAFE_TX_GAS: u64 = 300_000;
+            let get_tx_hash_sig = "getTransactionHash(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,uint256)";
+            let get_tx_hash_selector = keccak256(get_tx_hash_sig.as_bytes()).as_slice()[..4].to_vec();
+            let zero_addr = [0u8; 32];
+            let mut to_enc = [0u8; 32];
+            to_enc[12..].copy_from_slice(ctf_address.as_slice());
+            let data_offset_get_hash = U256::from(32u32 * 10u32);
+            let mut get_tx_hash_calldata = Vec::new();
+            get_tx_hash_calldata.extend_from_slice(&get_tx_hash_selector);
+            get_tx_hash_calldata.extend_from_slice(&to_enc);
+            get_tx_hash_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            get_tx_hash_calldata.extend_from_slice(&data_offset_get_hash.to_be_bytes::<32>());
+            get_tx_hash_calldata.push(0); get_tx_hash_calldata.extend_from_slice(&[0u8; 31]);
+            get_tx_hash_calldata.extend_from_slice(&U256::from(SAFE_TX_GAS).to_be_bytes::<32>());
+            get_tx_hash_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            get_tx_hash_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            get_tx_hash_calldata.extend_from_slice(&zero_addr);
+            get_tx_hash_calldata.extend_from_slice(&zero_addr);
+            get_tx_hash_calldata.extend_from_slice(&nonce.to_be_bytes::<32>());
+            get_tx_hash_calldata.extend_from_slice(&U256::from(redeem_calldata.len()).to_be_bytes::<32>());
+            get_tx_hash_calldata.extend_from_slice(&redeem_calldata);
+            let get_tx_hash_tx = TransactionRequest::default()
+                .to(safe_address)
+                .input(Bytes::from(get_tx_hash_calldata).into());
+            let tx_hash_result = provider_read.call(get_tx_hash_tx).await
+                .context("Failed to call Safe.getTransactionHash()")?;
+            let tx_hash_to_sign: B256 = tx_hash_result.as_ref().try_into()
+                .map_err(|_| anyhow::anyhow!("getTransactionHash did not return 32 bytes"))?;
+            const EIP191_PREFIX: &[u8] = b"\x19Ethereum Signed Message:\n32";
+            let mut eip191_message = Vec::with_capacity(EIP191_PREFIX.len() + 32);
+            eip191_message.extend_from_slice(EIP191_PREFIX);
+            eip191_message.extend_from_slice(tx_hash_to_sign.as_slice());
+            let hash_to_sign = keccak256(&eip191_message);
+            let sig = signer.sign_hash(&hash_to_sign).await
+                .context("Failed to sign Safe transaction hash")?;
+            let sig_bytes = sig.as_bytes();
+            let r = &sig_bytes[0..32];
+            let s = &sig_bytes[32..64];
+            let v = sig_bytes[64];
+            let v_safe = if v == 27 || v == 28 { v + 4 } else { v };
+            let mut packed_sig: Vec<u8> = Vec::with_capacity(85);
+            packed_sig.extend_from_slice(r);
+            packed_sig.extend_from_slice(s);
+            packed_sig.extend_from_slice(&[v_safe]);
+            let get_threshold_selector = keccak256("getThreshold()".as_bytes()).as_slice()[..4].to_vec();
+            let threshold_tx = TransactionRequest::default()
+                .to(safe_address)
+                .input(Bytes::from(get_threshold_selector).into());
+            let threshold_result = provider_read.call(threshold_tx).await
+                .context("Failed to call Safe.getThreshold()")?;
+            let threshold_bytes: [u8; 32] = threshold_result.as_ref().try_into()
+                .map_err(|_| anyhow::anyhow!("getThreshold did not return 32 bytes"))?;
+            let threshold = U256::from_be_slice(&threshold_bytes);
+            if threshold > U256::from(1) {
+                let owner = signer.address();
+                let mut with_owner = Vec::with_capacity(20 + packed_sig.len());
+                with_owner.extend_from_slice(owner.as_slice());
+                with_owner.extend_from_slice(&packed_sig);
+                packed_sig = with_owner;
+            }
+            let safe_sig_bytes = packed_sig;
+            let exec_sig = "execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)";
+            let exec_selector = keccak256(exec_sig.as_bytes()).as_slice()[..4].to_vec();
+            let data_offset = 32u32 * 10u32;
+            let sigs_offset = data_offset + 32 + redeem_calldata.len() as u32;
+            let mut exec_calldata = Vec::new();
+            exec_calldata.extend_from_slice(&exec_selector);
+            exec_calldata.extend_from_slice(&to_enc);
+            exec_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            exec_calldata.extend_from_slice(&U256::from(data_offset).to_be_bytes::<32>());
+            exec_calldata.push(0); exec_calldata.extend_from_slice(&[0u8; 31]);
+            exec_calldata.extend_from_slice(&U256::from(SAFE_TX_GAS).to_be_bytes::<32>());
+            exec_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            exec_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            exec_calldata.extend_from_slice(&zero_addr);
+            exec_calldata.extend_from_slice(&zero_addr);
+            exec_calldata.extend_from_slice(&U256::from(sigs_offset).to_be_bytes::<32>());
+            exec_calldata.extend_from_slice(&U256::from(redeem_calldata.len()).to_be_bytes::<32>());
+            exec_calldata.extend_from_slice(&redeem_calldata);
+            exec_calldata.extend_from_slice(&U256::from(safe_sig_bytes.len()).to_be_bytes::<32>());
+            exec_calldata.extend_from_slice(&safe_sig_bytes);
+            // Try Polymarket relayer first (API) when credentials are set; fall back to RPC on failure
+            if self.api_key.is_some() && self.api_secret.is_some() && self.api_passphrase.is_some() {
+                match self.submit_safe_redeem_via_relayer(
+                    signer.address(),
+                    safe_address_str,
+                    &exec_calldata,
+                    nonce,
+                    &safe_sig_bytes,
+                    SAFE_TX_GAS,
+                ).await {
+                    Ok(resp) => {
+                        eprintln!("Successfully redeemed via Polymarket relayer (API).");
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        eprintln!("   ⚠️  Relayer redeem failed: {}. Falling back to RPC...", e);
+                    }
+                }
+            }
+            (safe_address, exec_calldata, 400_000u64, true)
+        } else if use_proxy && sig_type == 1 {
+            eprintln!("   Using proxy wallet: sending redemption via Proxy Wallet Factory");
+            let factory_address = parse_address_hex(PROXY_WALLET_FACTORY)
+                .context("Failed to parse Proxy Wallet Factory address")?;
+            let selector = keccak256("proxy((uint8,address,uint256,bytes)[])".as_bytes());
+            let proxy_selector = &selector.as_slice()[..4];
+            let mut proxy_calldata = Vec::with_capacity(4 + 32 * 3 + 128 + 32 + redeem_calldata.len());
+            proxy_calldata.extend_from_slice(proxy_selector);
+            proxy_calldata.extend_from_slice(&U256::from(32u32).to_be_bytes::<32>());
+            proxy_calldata.extend_from_slice(&U256::from(1u32).to_be_bytes::<32>());
+            proxy_calldata.extend_from_slice(&U256::from(96u32).to_be_bytes::<32>());
+            let mut type_code = [0u8; 32];
+            type_code[31] = 1;
+            proxy_calldata.extend_from_slice(&type_code);
+            let mut to_bytes = [0u8; 32];
+            to_bytes[12..].copy_from_slice(ctf_address.as_slice());
+            proxy_calldata.extend_from_slice(&to_bytes);
+            proxy_calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+            proxy_calldata.extend_from_slice(&U256::from(128u32).to_be_bytes::<32>());
+            let data_len = redeem_calldata.len();
+            proxy_calldata.extend_from_slice(&U256::from(data_len).to_be_bytes::<32>());
+            proxy_calldata.extend_from_slice(&redeem_calldata);
+            (factory_address, proxy_calldata, 400_000u64, false)
+        } else {
+            eprintln!("   Sending redemption from EOA to CTF contract");
+            (ctf_address, redeem_calldata, 300_000, false)
+        };
+
+        let provider = ProviderBuilder::new()
+            .wallet(signer.clone())
+            .connect(RPC_URL)
+            .await
+            .context("Failed to connect to Polygon RPC")?;
+
+        // Optional: simulate Safe redeem before sending to surface CTF revert reason
+        if used_safe_redemption {
+            let sim_tx = TransactionRequest::default()
+                .from(signer.address())
+                .to(tx_to)
+                .input(Bytes::from(tx_data.clone()).into())
+                .value(U256::ZERO)
+                .gas_limit(gas_limit);
+            if let Err(e) = provider.call(sim_tx).await {
+                eprintln!("   ⚠️  Pre-flight simulation failed (inner redeem would revert): {}", e);
+                anyhow::bail!(
+                    "Redeem would revert. Simulation: {}. \
+                    Check conditionId, indexSet (Up=1, Down=2), and that the Safe holds the token. \
+                    If the market uses a non-zero parentCollectionId, redeem via Polymarket app.",
+                    e
+                );
+            }
         }
+
+        let tx_request = TransactionRequest::default()
+            .to(tx_to)
+            .input(Bytes::from(tx_data).into())
+            .value(U256::ZERO)
+            .gas_limit(gas_limit)
+            .max_fee_per_gas(200_000_000_000u128)
+            .max_priority_fee_per_gas(30_000_000_000u128);
+
+        let pending_tx = match provider.send_transaction(tx_request).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                let err_msg = format!("Failed to send redeem transaction: {}", e);
+                eprintln!("   {}", err_msg);
+                anyhow::bail!("{}", err_msg);
+            }
+        };
+
+        let tx_hash = *pending_tx.tx_hash();
+        eprintln!("   Transaction sent, waiting for confirmation...");
+        eprintln!("   Transaction hash: {:?}", tx_hash);
+
+        let receipt = pending_tx.get_receipt().await
+            .context("Failed to get transaction receipt")?;
+
+        if !receipt.status() {
+            anyhow::bail!("Redemption transaction failed. Transaction hash: {:?}", tx_hash);
+        }
+
+        if used_safe_redemption {
+            let payout_redemption_topic = keccak256(
+                b"PayoutRedemption(address,address,bytes32,bytes32,uint256[],uint256)"
+            );
+            let logs = receipt.logs();
+            let ctf_has_payout = logs.iter().any(|log| {
+                log.address() == ctf_address && log.topics().first().map(|t| t.as_slice()) == Some(payout_redemption_topic.as_slice())
+            });
+            if !ctf_has_payout {
+                anyhow::bail!(
+                    "Redemption tx was mined but the inner redeem reverted (no PayoutRedemption from CTF). \
+                    Possible causes: (1) Condition not yet resolved on-chain (oracle may not have reported); (2) tokens already redeemed; (3) conditionId/outcome/indexSet mismatch; (4) wrong collateral or parentCollectionId. \
+                    If the market just resolved, wait a few minutes and retry. Check the tx on Polygonscan for revert reason. Tx: {:?}",
+                    tx_hash
+                );
+            }
+        }
+
+        let redeem_response = RedeemResponse {
+            success: true,
+            message: Some(format!("Successfully redeemed tokens. Transaction: {:?}", tx_hash)),
+            transaction_hash: Some(format!("{:?}", tx_hash)),
+            amount_redeemed: None,
+        };
+        eprintln!("Successfully redeemed winning tokens!");
+        eprintln!("Transaction hash: {:?}", tx_hash);
+        if let Some(block_number) = receipt.block_number {
+            eprintln!("Block number: {}", block_number);
+        }
+        Ok(redeem_response)
     }
 
     /// Merge complete sets of Up and Down tokens for a condition into USDC.

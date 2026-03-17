@@ -221,6 +221,13 @@ async fn main() -> Result<()> {
         xrp_market_data,
         config.trading.check_interval_ms,
         is_simulation,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )?;
     let monitor_arc = Arc::new(monitor);
 
@@ -233,6 +240,7 @@ async fn main() -> Result<()> {
         min_time_remaining,
         config.trading.enable_eth_trading,
         config.trading.enable_solana_trading,
+        config.trading.enable_xrp_trading,
     );
 
     // Start monitoring
@@ -316,10 +324,7 @@ async fn main() -> Result<()> {
                     0 // Next period already started
             };
             
-            eprintln!("⏰ Current market period: {}, next period starts in {} seconds", 
-                current_market_timestamp, sleep_duration);
-            
-                // Only sleep if we have a reasonable duration (avoid infinite loops)
+            // Only sleep if we have a reasonable duration (avoid infinite loops)
                 if sleep_duration > 0 && sleep_duration < 1800 {
             tokio::time::sleep(tokio::time::Duration::from_secs(sleep_duration)).await;
                 } else if sleep_duration == 0 {

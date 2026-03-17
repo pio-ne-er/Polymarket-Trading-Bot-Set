@@ -7,6 +7,10 @@ use tokio::time::{sleep, Duration};
 use std::fs::OpenOptions;
 use std::io::Write;
 use chrono::Utc;
+use rust_decimal::Decimal;
+
+/// Map from token_id to (bid, ask) for WebSocket price cache.
+pub type WsPriceCache = std::collections::HashMap<String, (Option<Decimal>, Option<Decimal>)>;
 
 pub struct MarketMonitor {
     api: Arc<PolymarketApi>,
@@ -33,6 +37,20 @@ pub struct MarketMonitor {
     simulation_mode: bool,
     price_monitor_file: Option<Arc<tokio::sync::Mutex<std::fs::File>>>, // File for logging price monitoring data in simulation mode
     market_price_files: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<std::fs::File>>>>>, // Per-market price files
+    /// Period duration in seconds (e.g. 900 for 15m, 300 for 5m). Used for time_remaining fallback and period rounding.
+    period_seconds: u64,
+    /// If false, omit ETH from the one-line price log (efficient logging when ETH trading disabled).
+    log_enable_eth: bool,
+    log_enable_solana: bool,
+    log_enable_xrp: bool,
+    /// Current Chainlink BTC/USD from RTDS (optional). When set, price line shows BTC price, price-to-beat, and diff.
+    chainlink_btc: Option<Arc<tokio::sync::Mutex<Option<f64>>>>,
+    /// Per-period Chainlink price at first sight (used as "price to beat" for logging).
+    price_to_beat_cache: Option<Arc<tokio::sync::Mutex<std::collections::HashMap<u64, f64>>>>,
+    /// Optional trailing status string (e.g. "trail: Up low=0.41 trig=0.44 band=0.50"). When set by the binary, appended to the price line.
+    trailing_status_line: Option<Arc<tokio::sync::Mutex<String>>>,
+    /// Optional Binance BTC/USDT spot price. When set, logged right after BTC Up/Down token prices.
+    binance_btc_usdt: Option<Arc<tokio::sync::Mutex<Option<f64>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +65,10 @@ pub struct MarketSnapshot {
 }
 
 impl MarketMonitor {
+    /// Create a new MarketMonitor.
+    /// enable_eth_trading, enable_solana_trading, enable_xrp_trading: if Some(false), that market is omitted from the one-line price log.
+    /// chainlink_btc: when Some(arc), the price line will include Chainlink BTC price, price-to-beat (at period start), and difference.
+    /// trailing_status_line: when Some(arc), the price line will append the string (e.g. trailing lowest/trigger/band for 5m BTC).
     pub fn new(
         api: Arc<PolymarketApi>,
         eth_market: crate::models::Market,
@@ -55,13 +77,26 @@ impl MarketMonitor {
         xrp_market: crate::models::Market,
         check_interval_ms: u64,
         simulation_mode: bool,
+        period_seconds: Option<u64>,
+        enable_eth_trading: Option<bool>,
+        enable_solana_trading: Option<bool>,
+        enable_xrp_trading: Option<bool>,
+        chainlink_btc: Option<Arc<tokio::sync::Mutex<Option<f64>>>>,
+        trailing_status_line: Option<Arc<tokio::sync::Mutex<String>>>,
+        binance_btc_usdt: Option<Arc<tokio::sync::Mutex<Option<f64>>>>,
     ) -> Result<Self> {
-        // Calculate current 15-minute period timestamp
+        let period_secs = period_seconds.unwrap_or(900);
+        // Calculate current period timestamp (e.g. 15m = 900, 5m = 300)
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let current_period = (current_time / 900) * 900; // Round to nearest 15 minutes
+        let current_period = (current_time / period_secs) * period_secs;
+
+        let log_enable_eth = enable_eth_trading.unwrap_or(true);
+        let log_enable_solana = enable_solana_trading.unwrap_or(true);
+        let log_enable_xrp = enable_xrp_trading.unwrap_or(true);
+        let price_to_beat_cache = chainlink_btc.as_ref().map(|_| Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())));
         
         // Create price monitor file if in simulation mode
         let price_monitor_file = if simulation_mode {
@@ -104,10 +139,18 @@ impl MarketMonitor {
             simulation_mode,
             price_monitor_file,
             market_price_files: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            period_seconds: period_secs,
+            log_enable_eth,
+            log_enable_solana,
+            log_enable_xrp,
+            chainlink_btc,
+            price_to_beat_cache,
+            trailing_status_line,
+            binance_btc_usdt,
         })
     }
 
-    /// Update markets when a new 15-minute period starts
+    /// Update markets when a new period starts
     pub async fn update_markets(&self, eth_market: crate::models::Market, btc_market: crate::models::Market, solana_market: crate::models::Market, xrp_market: crate::models::Market) -> Result<()> {
         eprintln!("🔄 Updating to new 15-minute period markets...");
         eprintln!("✅ ETH Market: {} ({}) - Active trading", eth_market.slug, eth_market.condition_id);
@@ -145,12 +188,17 @@ impl MarketMonitor {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let new_period = (current_time / 900) * 900;
+        let new_period = (current_time / self.period_seconds) * self.period_seconds;
         *self.current_period_timestamp.lock().await = new_period;
         
         Ok(())
     }
 
+    /// Force refresh of token IDs for current markets (e.g. after update_markets so WebSocket can subscribe to new period's tokens immediately).
+    pub async fn refresh_token_ids_for_new_period(&self) -> Result<()> {
+        *self.last_market_refresh.lock().await = None;
+        self.refresh_market_tokens().await
+    }
 
     /// Get current market condition IDs (for checking if markets are closed)
     pub async fn get_current_condition_ids(&self) -> (String, String) {
@@ -169,19 +217,49 @@ impl MarketMonitor {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            (current_time / 900) * 900
+            (current_time / self.period_seconds) * self.period_seconds
         } else {
             timestamp
         }
     }
 
+    /// Return all current token IDs (for WebSocket subscription). Used by CLOB price WebSocket.
+    pub async fn get_current_token_ids(&self) -> Vec<String> {
+        let mut ids = Vec::with_capacity(8);
+        if let Some(ref id) = *self.btc_up_token_id.lock().await {
+            ids.push(id.clone());
+        }
+        if let Some(ref id) = *self.btc_down_token_id.lock().await {
+            ids.push(id.clone());
+        }
+        if let Some(ref id) = *self.eth_up_token_id.lock().await {
+            ids.push(id.clone());
+        }
+        if let Some(ref id) = *self.eth_down_token_id.lock().await {
+            ids.push(id.clone());
+        }
+        if let Some(ref id) = *self.solana_up_token_id.lock().await {
+            ids.push(id.clone());
+        }
+        if let Some(ref id) = *self.solana_down_token_id.lock().await {
+            ids.push(id.clone());
+        }
+        if let Some(ref id) = *self.xrp_up_token_id.lock().await {
+            ids.push(id.clone());
+        }
+        if let Some(ref id) = *self.xrp_down_token_id.lock().await {
+            ids.push(id.clone());
+        }
+        ids
+    }
+
     /// Refresh market data once per period (15 minutes) to get token IDs
     async fn refresh_market_tokens(&self) -> Result<()> {
-        // Check if we need to refresh (every 15 minutes = 900 seconds)
+        // Check if we need to refresh (once per period)
         let should_refresh = {
             let last_refresh = self.last_market_refresh.lock().await;
             last_refresh
-                .map(|last| last.elapsed().as_secs() >= 900)
+                .map(|last| last.elapsed().as_secs() >= self.period_seconds)
                 .unwrap_or(true)
         };
 
@@ -289,9 +367,9 @@ impl MarketMonitor {
         Ok(())
     }
 
-    /// Fetch current market data for both ETH and BTC markets
-    /// Uses get_price() endpoint continuously for real-time prices
-    pub async fn fetch_market_data(&self) -> Result<MarketSnapshot> {
+    /// Fetch current market data. When `price_cache` is Some, reads bid/ask from the cache (WebSocket);
+    /// otherwise fetches prices via REST (polling).
+    pub async fn fetch_market_data(&self, price_cache: Option<&WsPriceCache>) -> Result<MarketSnapshot> {
         // Refresh token IDs if needed (once per 15-minute period)
         self.refresh_market_tokens().await?;
 
@@ -332,8 +410,8 @@ impl MarketMonitor {
             .as_secs();
 
         // Calculate remaining time - use actual market end time from API if available
-        // Otherwise fall back to slug timestamp + 900 seconds
-        const PERIOD_DURATION: u64 = 900; // 15 minutes in seconds (fallback)
+        // Otherwise fall back to slug timestamp + period_seconds
+        let period_duration = self.period_seconds;
         
         // Try to use actual market end time from API
         let btc_market_end = {
@@ -358,24 +436,24 @@ impl MarketMonitor {
         let btc_period_end = if let Some(api_end_time) = btc_market_end {
             api_end_time // Use actual end time from API
         } else {
-            btc_market_timestamp + PERIOD_DURATION // Fallback to slug + 900s
+            btc_market_timestamp + period_duration
         };
         
         let eth_period_end = if let Some(api_end_time) = eth_market_end {
             api_end_time // Use actual end time from API
         } else {
-            eth_market_timestamp + PERIOD_DURATION // Fallback to slug + 900s
+            eth_market_timestamp + period_duration
         };
         
         let solana_period_end = if let Some(api_end_time) = solana_market_end {
             api_end_time // Use actual end time from API
         } else {
-            solana_market_timestamp + PERIOD_DURATION // Fallback to slug + 900s
+            solana_market_timestamp + period_duration
         };
         let xrp_period_end = if let Some(api_end_time) = xrp_market_end {
             api_end_time // Use actual end time from API
         } else {
-            xrp_market_timestamp + PERIOD_DURATION // Fallback to slug + 900s
+            xrp_market_timestamp + period_duration
         };
         
         let eth_remaining_secs = if eth_period_end > current_timestamp {
@@ -405,63 +483,77 @@ impl MarketMonitor {
         let (btc_up_price, btc_down_price) = if btc_condition_id == "dummy_btc_fallback" {
             (None, None)
         } else if btc_remaining_secs == 0 {
-            // Market is closed - skip repeated checks (only log once)
             (None, None)
-        } else {
-            // Market is still open - fetch prices from order book
+        } else if let Some(cache) = price_cache {
             let btc_up_token_id = self.btc_up_token_id.lock().await.clone();
             let btc_down_token_id = self.btc_down_token_id.lock().await.clone();
-            
+            tokio::join!(
+                self.token_price_from_cache_or_rest(&btc_up_token_id, cache, "BTC", "Up"),
+                self.token_price_from_cache_or_rest(&btc_down_token_id, cache, "BTC", "Down"),
+            )
+        } else {
+            let btc_up_token_id = self.btc_up_token_id.lock().await.clone();
+            let btc_down_token_id = self.btc_down_token_id.lock().await.clone();
             tokio::join!(
                 self.fetch_token_price(&btc_up_token_id, "BTC", "Up"),
                 self.fetch_token_price(&btc_down_token_id, "BTC", "Down"),
             )
         };
-        
-        // Fetch ETH prices (skip if disabled)
+
         let (eth_up_price, eth_down_price) = if eth_condition_id == "dummy_eth_fallback" {
             (None, None)
         } else if eth_remaining_secs == 0 {
-            // Market is closed - skip repeated checks (only log once)
             (None, None)
-        } else {
-            // Market is still open - fetch prices from order book
+        } else if let Some(cache) = price_cache {
             let eth_up_token_id = self.eth_up_token_id.lock().await.clone();
             let eth_down_token_id = self.eth_down_token_id.lock().await.clone();
-            
+            tokio::join!(
+                self.token_price_from_cache_or_rest(&eth_up_token_id, cache, "ETH", "Up"),
+                self.token_price_from_cache_or_rest(&eth_down_token_id, cache, "ETH", "Down"),
+            )
+        } else {
+            let eth_up_token_id = self.eth_up_token_id.lock().await.clone();
+            let eth_down_token_id = self.eth_down_token_id.lock().await.clone();
             tokio::join!(
                 self.fetch_token_price(&eth_up_token_id, "ETH", "Up"),
                 self.fetch_token_price(&eth_down_token_id, "ETH", "Down"),
             )
         };
-        
-        // Fetch Solana prices (skip API when dummy fallback - no real market)
+
         let (solana_up_price, solana_down_price) = if solana_condition_id == "dummy_solana_fallback" {
             (None, None)
         } else if solana_remaining_secs == 0 {
-            // Market is closed - skip repeated checks (only log once)
             (None, None)
-        } else {
-            // Market is still open - fetch prices from order book
+        } else if let Some(cache) = price_cache {
             let solana_up_token_id = self.solana_up_token_id.lock().await.clone();
             let solana_down_token_id = self.solana_down_token_id.lock().await.clone();
-            
+            tokio::join!(
+                self.token_price_from_cache_or_rest(&solana_up_token_id, cache, "Solana", "Up"),
+                self.token_price_from_cache_or_rest(&solana_down_token_id, cache, "Solana", "Down"),
+            )
+        } else {
+            let solana_up_token_id = self.solana_up_token_id.lock().await.clone();
+            let solana_down_token_id = self.solana_down_token_id.lock().await.clone();
             tokio::join!(
                 self.fetch_token_price(&solana_up_token_id, "Solana", "Up"),
                 self.fetch_token_price(&solana_down_token_id, "Solana", "Down"),
             )
         };
 
-        // Fetch XRP prices (skip API when dummy fallback - no real market)
         let (xrp_up_price, xrp_down_price) = if xrp_condition_id == "dummy_xrp_fallback" {
             (None, None)
         } else if xrp_remaining_secs == 0 {
-            // Market is closed - skip repeated checks (only log once)
             (None, None)
+        } else if let Some(cache) = price_cache {
+            let xrp_up_token_id = self.xrp_up_token_id.lock().await.clone();
+            let xrp_down_token_id = self.xrp_down_token_id.lock().await.clone();
+            tokio::join!(
+                self.token_price_from_cache_or_rest(&xrp_up_token_id, cache, "XRP", "Up"),
+                self.token_price_from_cache_or_rest(&xrp_down_token_id, cache, "XRP", "Down"),
+            )
         } else {
             let xrp_up_token_id = self.xrp_up_token_id.lock().await.clone();
             let xrp_down_token_id = self.xrp_down_token_id.lock().await.clone();
-
             tokio::join!(
                 self.fetch_token_price(&xrp_up_token_id, "XRP", "Up"),
                 self.fetch_token_price(&xrp_down_token_id, "XRP", "Down"),
@@ -554,20 +646,61 @@ impl MarketMonitor {
         );
 
         // Log prices to terminal (real-time monitoring) - NOT saved to history.toml
-        // Compact one-line format for easy monitoring: BTC/ETH/SOL/XRP Up/Down, single timer
+        // Only include markets that have trading enabled (efficient logging)
         let time_remaining_str = format_remaining_time(time_remaining_seconds);
-        let price_log_line = format!("📊 BTC: U{} D{} | ETH: U{} D{} | SOL: U{} D{} | XRP: U{} D{} | ⏱️  {}", 
-            btc_up_str, btc_down_str,
-            eth_up_str, eth_down_str,
-            solana_up_str, solana_down_str,
-            xrp_up_str, xrp_down_str,
-            time_remaining_str);
-        eprintln!("{}", price_log_line);
-        
-        // Always log prices to files (both simulation and production/price monitor mode)
+        let mut parts: Vec<String> = vec![
+            format!("📊 BTC: U{} D{}", btc_up_str, btc_down_str),
+        ];
+        if let Some(ref binance_arc) = self.binance_btc_usdt {
+            if let Some(btc) = binance_arc.lock().await.as_ref().copied() {
+                parts.push(format!("Binance ${:.0}", btc));
+            }
+        }
+        if self.log_enable_eth {
+            parts.push(format!("ETH: U{} D{}", eth_up_str, eth_down_str));
+        }
+        if self.log_enable_solana {
+            parts.push(format!("SOL: U{} D{}", solana_up_str, solana_down_str));
+        }
+        if self.log_enable_xrp {
+            parts.push(format!("XRP: U{} D{}", xrp_up_str, xrp_down_str));
+        }
+        parts.push(format!("⏱️  {}", time_remaining_str));
+
+        // Chainlink BTC and price-to-beat (from RTDS). Price-to-beat = Chainlink BTC at the 0-second-remaining moment of the *previous* market (transition).
+        if let (Some(chainlink_arc), Some(cache_arc)) = (&self.chainlink_btc, &self.price_to_beat_cache) {
+            let chainlink = chainlink_arc.lock().await;
+            if let Some(&btc_now) = chainlink.as_ref() {
+                drop(chainlink);
+                let period = btc_market_timestamp;
+                let mut cache = cache_arc.lock().await;
+                // When current market hits 0s remaining, record this BTC price as price-to-beat for the *next* period.
+                if time_remaining_seconds == 0 {
+                    cache.insert(period + self.period_seconds, btc_now);
+                }
+                let beat = cache.get(&period).copied();
+                if let Some(beat) = beat {
+                    let diff = btc_now - beat;
+                    parts.push(format!("| BTC ${:.0} beat ${:.0} Δ{:+.0}", btc_now, beat, diff));
+                } else {
+                    parts.push(format!("| BTC ${:.0} beat -", btc_now));
+                }
+            }
+        }
+
+        if let Some(ref status_arc) = self.trailing_status_line {
+            let s = status_arc.lock().await;
+            if !s.is_empty() {
+                parts.push(s.clone());
+            }
+        }
+
+        let price_log_line = parts.join(" | ");
         let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
         let log_entry = format!("[{}] {}\n", timestamp, price_log_line);
-        
+        crate::log_to_history(&log_entry);
+
+        // Always log prices to files (both simulation and production/price monitor mode)
         // Write to main price monitor file (if in simulation mode)
         if self.simulation_mode {
             if let Some(file_mutex) = &self.price_monitor_file {
@@ -642,6 +775,35 @@ impl MarketMonitor {
             time_remaining_seconds,
             period_timestamp: btc_market_timestamp, // Use BTC market timestamp as period identifier
         })
+    }
+
+    fn token_price_from_cache(
+        token_id: &Option<String>,
+        cache: &WsPriceCache,
+    ) -> Option<TokenPrice> {
+        let id = token_id.as_ref()?;
+        let (bid, ask) = cache.get(id)?;
+        Some(TokenPrice {
+            token_id: id.clone(),
+            bid: *bid,
+            ask: *ask,
+        })
+    }
+
+    /// When using WebSocket cache: use cache if present, otherwise fetch via REST (e.g. right after new period subscribe when WS has not sent data yet).
+    async fn token_price_from_cache_or_rest(
+        &self,
+        token_id: &Option<String>,
+        cache: &WsPriceCache,
+        market_name: &str,
+        outcome: &str,
+    ) -> Option<TokenPrice> {
+        if let Some(tp) = Self::token_price_from_cache(token_id, cache) {
+            if tp.bid.is_some() || tp.ask.is_some() {
+                return Some(tp);
+            }
+        }
+        self.fetch_token_price(token_id, market_name, outcome).await
     }
 
     async fn fetch_token_price(
@@ -761,7 +923,7 @@ impl MarketMonitor {
         eprintln!("Starting market monitoring...");
         
         loop {
-            match self.fetch_market_data().await {
+            match self.fetch_market_data(None).await {
                 Ok(snapshot) => {
                     debug!("Market snapshot updated");
                     callback(snapshot).await;
@@ -771,6 +933,56 @@ impl MarketMonitor {
                 }
             }
             
+            sleep(self.check_interval).await;
+        }
+    }
+
+    /// Like `start_monitoring`, but prices are read from the WebSocket-backed `price_cache` instead of REST polling.
+    /// Use with `crate::clob_ws::spawn_clob_price_ws_task` so the cache is updated by the CLOB market WebSocket.
+    pub async fn start_monitoring_with_ws_prices<F, Fut>(
+        &self,
+        price_cache: Arc<tokio::sync::Mutex<WsPriceCache>>,
+        callback: F,
+    ) where
+        F: Fn(MarketSnapshot) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        eprintln!("Starting market monitoring (prices from WebSocket)...");
+        self.start_monitoring_optional_ws(Some(price_cache), callback).await;
+    }
+
+    /// Start monitoring: when `price_cache` is Some, use it for prices (WebSocket mode); when None, use REST polling.
+    pub async fn start_monitoring_optional_ws<F, Fut>(
+        &self,
+        price_cache: Option<Arc<tokio::sync::Mutex<WsPriceCache>>>,
+        callback: F,
+    ) where
+        F: Fn(MarketSnapshot) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let from_ws = price_cache.is_some();
+        eprintln!(
+            "Starting market monitoring (prices from {})...",
+            if from_ws { "WebSocket" } else { "REST polling" }
+        );
+        loop {
+            let snapshot_result = if let Some(ref cache) = price_cache {
+                let guard = cache.lock().await;
+                let result = self.fetch_market_data(Some(&*guard)).await;
+                drop(guard);
+                result
+            } else {
+                self.fetch_market_data(None).await
+            };
+            match snapshot_result {
+                Ok(snapshot) => {
+                    debug!("Market snapshot updated");
+                    callback(snapshot).await;
+                }
+                Err(e) => {
+                    warn!("Error fetching market data: {}", e);
+                }
+            }
             sleep(self.check_interval).await;
         }
     }

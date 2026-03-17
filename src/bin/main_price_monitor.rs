@@ -62,6 +62,13 @@ async fn main() -> Result<()> {
         xrp_market_data,
         config.trading.check_interval_ms,
         false, // Not simulation mode, but we're just monitoring
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )?);
 
     eprintln!("🔄 Starting price monitoring...");
@@ -130,7 +137,7 @@ async fn main() -> Result<()> {
 
     // Main loop: continuously fetch and record prices
     loop {
-        match monitor.fetch_market_data().await {
+        match monitor.fetch_market_data(None).await {
             Ok(snapshot) => {
                 // Prices are automatically written to history files by MarketMonitor
                 // The monitor already logs prices to files, so we don't need to log here

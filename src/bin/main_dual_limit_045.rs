@@ -20,6 +20,10 @@ const LIMIT_PRICE: f64 = 0.45;
 const PERIOD_DURATION: u64 = 900;
 const DEFAULT_HEDGE_AFTER_MINUTES: u64 = 10;
 const DEFAULT_HEDGE_PRICE: f64 = 0.85;
+/// Re-entry limit buy price for the opposite token (placed once per period after hedging)
+const REENTRY_LIMIT_PRICE: f64 = 0.05;
+/// When 0.05 re-entry is filled and this token's price drops below 0.7, place both Up/Down at 0.45 with 10x size
+const SECOND_WAVE_PRICE_THRESHOLD: f64 = 0.7;
 
 /// A writer that writes to both stderr (terminal) and a file
 struct DualWriter {
@@ -197,6 +201,13 @@ async fn main() -> Result<()> {
         xrp_market_data,
         config.trading.check_interval_ms,
         is_simulation,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )?;
     let monitor_arc = Arc::new(monitor);
 
@@ -265,9 +276,6 @@ async fn main() -> Result<()> {
                 } else {
                     0
                 };
-
-                eprintln!("⏰ Current market period: {}, next period starts in {} seconds",
-                    current_market_timestamp, sleep_duration);
 
                 if sleep_duration > 0 && sleep_duration < 1800 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(sleep_duration)).await;
@@ -350,6 +358,15 @@ async fn main() -> Result<()> {
     // Track if we've already executed early hedge for this period
     let early_hedge_executed: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>> = 
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    // Track (period_timestamp, condition_id) for which we already placed re-entry limit buy (opposite token at 0.05)
+    let reentry_placed: Arc<tokio::sync::Mutex<std::collections::HashSet<(u64, String)>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    // Map (period, condition_id) -> token_id of the re-entry token (0.05 order), so we can check fill and price
+    let reentry_token_by_market: Arc<tokio::sync::Mutex<std::collections::HashMap<(u64, String), String>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    // Track (period_timestamp, condition_id) for which we already placed second wave (both Up/Down at 0.45, 10x)
+    let second_wave_placed: Arc<tokio::sync::Mutex<std::collections::HashSet<(u64, String)>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
     monitor_arc.start_monitoring(move |snapshot| {
         let trader = trader_clone.clone();
@@ -366,28 +383,25 @@ async fn main() -> Result<()> {
         let fixed_trade_amount = config.trading.fixed_trade_amount;
         let previous_prices = previous_prices.clone();
         let early_hedge_executed = early_hedge_executed.clone();
+        let reentry_placed = reentry_placed.clone();
+        let reentry_token_by_market = reentry_token_by_market.clone();
+        let second_wave_placed = second_wave_placed.clone();
 
         async move {
             if snapshot.time_remaining_seconds == 0 {
                 return;
             }
 
-            // Skip the current market if the bot starts after it has already begun.
+            // Track period for logging; do NOT skip first snapshot (we need it to place limit orders in 0-2s window).
             {
                 let mut seen = last_seen_period.lock().await;
-                if seen.is_none() {
-                    *seen = Some(snapshot.period_timestamp);
-                    return;
-                }
-                if *seen != Some(snapshot.period_timestamp) {
-                    *seen = Some(snapshot.period_timestamp);
-                }
+                *seen = Some(snapshot.period_timestamp);
             }
 
             let time_elapsed_seconds = PERIOD_DURATION - snapshot.time_remaining_seconds;
-            // Market-start placement (first ~2 seconds)
+            // Market-start placement (first 5 seconds so we don't miss if first snapshot is delayed)
             let mut opportunities: Vec<BuyOpportunity> = Vec::new();
-            if time_elapsed_seconds <= 2 {
+            if time_elapsed_seconds <= 5 {
             {
                 let mut last = last_placed_period.lock().await;
                 if last.map(|p| p == snapshot.period_timestamp).unwrap_or(false) {
@@ -572,7 +586,7 @@ async fn main() -> Result<()> {
                             let trader_clone = trader.clone();
                             let limit_shares_clone = limit_shares;
                             tokio::spawn(async move {
-                                trader_clone.execute_limit_buy(&opp, false, limit_shares_clone).await
+                                trader_clone.execute_limit_buy(&opp, false, limit_shares_clone, false).await
                             })
                         })
                         .collect();
@@ -1006,12 +1020,14 @@ async fn main() -> Result<()> {
                         }
                         drop(prev_prices);
                         
-                        // Handle individual hedging for ALL markets with one-sided fill pattern
-                        // If any token crossed $0.85, check ALL markets and handle individually
+                        // Always check ALL markets for one-sided fill and hedge when unfilled side >= $0.85
+                        // (Don't require "cross this tick" - price may have crossed before 5 min elapsed)
                         if !crossed_tokens.is_empty() {
                             crate::log_println!("🚨 {} token(s) crossed ${:.2} threshold - Checking ALL markets for individual hedging", 
                                 crossed_tokens.len(), hedge_price);
-                            
+                        }
+                        // Run hedge check every time we're past early_hedge_after: one-sided fill + unfilled price >= 0.85
+                        {
                             let mut any_hedge_executed = false;
                             
                             // Check ALL markets for one-sided fill pattern and handle individually
@@ -1082,7 +1098,9 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     (None, None) => {
-                                        // Neither trade exists - skip this market
+                                        // Neither trade exists - limit orders were likely never placed (e.g. bot started after market open)
+                                        crate::log_println!("⚠️  {} HEDGE SKIPPED (early): No pending limit trades for period {} - limit orders may not have been placed at market start (first 2s)", 
+                                            market_name, snapshot.period_timestamp);
                                         continue;
                                     }
                                 };
@@ -1160,8 +1178,8 @@ async fn main() -> Result<()> {
                                             continue;
                                         }
                                         
-                                        // Always buy 2x the original amount for individual hedges
-                                        let investment_amount = fixed_trade_amount * 2.0;
+                                        // Buy 5x the original amount for individual hedges
+                                        let investment_amount = fixed_trade_amount * 5.0;
                                         let expected_shares = investment_amount / current_price;
                                         
                                         let has_crossed = current_price >= hedge_price;
@@ -1173,16 +1191,12 @@ async fn main() -> Result<()> {
                                         }
                                         crate::log_println!("   Pattern: One side filled, unfilled side is uptrending");
                                         crate::log_println!("   Executing MARKET order for {} unfilled token at ${:.4}...", market_name, current_price);
-                                        crate::log_println!("   💰 Buying DOUBLE amount: ${:.2} for ~{:.6} shares", 
+                                        crate::log_println!("   💰 Buying 5x amount: ${:.2} for ~{:.6} shares", 
                                             investment_amount, expected_shares);
                                         
-                                    // Cancel the unfilled limit order (if it exists)
-                                    if let Err(e) = trader.cancel_pending_limit_buy(snapshot.period_timestamp, &unfilled_token.token_id).await {
-                                        warn!("Failed to cancel {} {} limit order: {} (may not exist)", market_name, token_side, e);
-                                        // Continue anyway - order may not exist
-                                    }
-                                    
-                                    // Place MARKET buy order
+                                    // Do not cancel the unfilled $0.45 limit order - leave it in place.
+                                    // Place MARKET buy order (5x amount)
+                                    crate::log_println!("   📋 Hedge opportunity: investment_amount_override = ${:.2} (5x)", investment_amount);
                                     let opp = BuyOpportunity {
                                         condition_id: condition_id.to_string(),
                                         token_id: unfilled_token.token_id.clone(),
@@ -1192,19 +1206,19 @@ async fn main() -> Result<()> {
                                         time_remaining_seconds: snapshot.time_remaining_seconds,
                                         time_elapsed_seconds,
                                         use_market_order: true, // MARKET ORDER
-                                        investment_amount_override: Some(investment_amount), // Always 2x for individual hedges
-                                        is_individual_hedge: true, // Mark as individual hedge to place limit sell order
+                                        investment_amount_override: Some(investment_amount), // 5x for individual hedges
+                                        is_individual_hedge: true, // Mark as individual hedge to place limit sell orders
                                         is_standard_hedge: false,
-                                        dual_limit_shares: limit_shares, // Pass dual_limit_shares for sell orders
+                                        dual_limit_shares: limit_shares.map(|s| s * 5.0), // 5x total shares for 5 sell orders
                                     };
                                     
                                     if let Err(e) = trader.execute_buy(&opp).await {
                                         warn!("Failed to execute market buy for {} {}: {}", market_name, token_side, e);
                                         continue; // Try next market
                                     } else {
-                                        crate::log_println!("✅ Market buy executed for {} {}: ~{:.6} shares (double amount) at ~${:.4}", 
+                                        crate::log_println!("✅ Market buy executed for {} {}: ~{:.6} shares (5x amount) at ~${:.4}", 
                                             market_name, token_side, expected_shares, current_price);
-                                        crate::log_println!("   📤 Two limit sell orders will be placed at $0.93 and $0.98 after 7 seconds");
+                                        crate::log_println!("   📤 Early hedge: no limit sell - position held until market closure");
                                         any_hedge_executed = true;
                                     }
                                 } else {
@@ -1294,7 +1308,10 @@ async fn main() -> Result<()> {
                     let up_trade = trader.get_pending_limit_trade(period_timestamp, &up.token_id).await;
                     let down_trade = trader.get_pending_limit_trade(period_timestamp, &down.token_id).await;
 
-                    let (Some(up_trade), Some(down_trade)) = (up_trade, down_trade) else { return; };
+                    let (Some(up_trade), Some(down_trade)) = (up_trade, down_trade) else {
+                        crate::log_println!("⚠️  Standard hedge skipped for period {}: missing pending limit trade(s) (need both Up and Down - place limit orders at market start)", period_timestamp);
+                        return;
+                    };
 
                     let up_filled = up_trade.buy_order_confirmed;
                     let down_filled = down_trade.buy_order_confirmed;
@@ -1333,25 +1350,22 @@ async fn main() -> Result<()> {
                             return;
                         }
 
-                        // Double the investment amount for hedge benefit
-                        let double_investment_amount = fixed_trade_amount * 2.0;
+                        // 5x the investment amount for standard hedge (price crossed after dual_limit_hedge_after_minutes)
+                        let five_investment_amount = fixed_trade_amount * 5.0;
 
                         crate::log_println!(
-                            "🛑 Hedge trigger: {} filled, {} unfilled. BUY price {:.4} >= {:.2}. Cancelling unfilled order and buying {} at current price {:.4} with market order (DOUBLE amount: ${:.6})",
+                            "🛑 Hedge trigger: {} filled, {} unfilled. BUY price {:.4} >= {:.2}. Cancelling unfilled order and buying {} at current price {:.4} with market order (5x amount: ${:.6})",
                             filled_trade.token_type.display_name(),
                             unfilled_token_type.display_name(),
                             unfilled_buy_price_f64,
                             hedge_price,
                             unfilled_token_type.display_name(),
                             unfilled_buy_price_f64,
-                            double_investment_amount
+                            five_investment_amount
                         );
 
-                        if let Err(e) = trader.cancel_pending_limit_buy(period_timestamp, &unfilled_token_id).await {
-                            warn!("Failed to cancel unfilled limit buy: {}", e);
-                            return;
-                        }
-
+                        // Do not cancel the unfilled $0.45 limit order - leave it in place.
+                        crate::log_println!("   📋 Standard hedge opportunity: investment_amount_override = ${:.2} (5x, 4 sells at $0.93 + 1 at $0.98)", five_investment_amount);
                         let opp = BuyOpportunity {
                             condition_id: condition_id.to_string(),
                             token_id: unfilled_token_id,
@@ -1361,10 +1375,10 @@ async fn main() -> Result<()> {
                             time_remaining_seconds,
                             time_elapsed_seconds,
                             use_market_order: true, // Use market order for standard hedge
-                            investment_amount_override: Some(double_investment_amount),
+                            investment_amount_override: Some(five_investment_amount),
                             is_individual_hedge: false,
-                            is_standard_hedge: true, // This is a standard hedge (after dual_limit_hedge_after_minutes)
-                            dual_limit_shares: limit_shares, // Pass dual_limit_shares for sell orders
+                            is_standard_hedge: true, // Standard hedge: 5x, 4 at $0.93 + 1 at $0.98
+                            dual_limit_shares: limit_shares.map(|s| s * 5.0), // 5x total shares for 5 sell orders
                         };
 
                         if let Err(e) = trader.execute_buy(&opp).await {
@@ -1442,6 +1456,216 @@ async fn main() -> Result<()> {
                         fixed_trade_amount,
                     )
                     .await;
+                }
+            }
+
+            // Hedge re-entry: after any hedge (early or standard), place a limit buy for the opposite
+            // token (originally filled side) at $0.05, size = 5× original $0.45 fill shares (once per period).
+            {
+                let hedge_trades = trader.get_hedge_trades_for_period(snapshot.period_timestamp).await;
+                for (condition_id, _token_id, token_type) in hedge_trades {
+                    let key = (snapshot.period_timestamp, condition_id.clone());
+                    let placed = reentry_placed.lock().await;
+                    if placed.contains(&key) {
+                        continue;
+                    }
+                    drop(placed);
+
+                    // Re-entry: place limit buy for opposite token (originally filled side) at $0.05,
+                    // size = 5 × original $0.45 fill shares. Trigger once per period when we have a hedge (no price condition).
+                    let opposite_type = token_type.opposite();
+                    let opposite_token_id = match trader.get_opposite_token_id(&opposite_type, &condition_id).await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            warn!("Re-entry: could not get opposite token for {}: {}", token_type.display_name(), e);
+                            continue;
+                        }
+                    };
+
+                    // Get original fill (the $0.45 limit that filled) to compute 5× shares
+                    let original_fill = match trader.get_pending_limit_trade(snapshot.period_timestamp, &opposite_token_id).await {
+                        Some(t) if t.buy_order_confirmed => t,
+                        _ => {
+                            debug!("Re-entry: no filled original limit trade for {} (period {}), skipping", opposite_type.display_name(), snapshot.period_timestamp);
+                            continue;
+                        }
+                    };
+                    let original_units = original_fill.units;
+                    let re_entry_shares = 5.0 * original_units;
+
+                    crate::log_println!(
+                        "📉 RE-ENTRY: After hedge. Placing limit buy for {} at ${:.2} (5× original fill: {:.6} → {:.6} shares)",
+                        opposite_type.display_name(),
+                        REENTRY_LIMIT_PRICE,
+                        original_units,
+                        re_entry_shares
+                    );
+                    let opp = BuyOpportunity {
+                        condition_id: condition_id.clone(),
+                        token_id: opposite_token_id,
+                        token_type: opposite_type,
+                        bid_price: REENTRY_LIMIT_PRICE,
+                        period_timestamp: snapshot.period_timestamp,
+                        time_remaining_seconds: snapshot.time_remaining_seconds,
+                        time_elapsed_seconds,
+                        use_market_order: false,
+                        investment_amount_override: None,
+                        is_individual_hedge: false,
+                        is_standard_hedge: false,
+                        dual_limit_shares: None,
+                    };
+                    if let Err(e) = trader.execute_limit_buy(&opp, false, Some(re_entry_shares), true).await {
+                        warn!("Re-entry limit buy failed: {}", e);
+                        continue;
+                    }
+                    {
+                        let mut token_map = reentry_token_by_market.lock().await;
+                        token_map.insert(key.clone(), opp.token_id.clone());
+                    }
+                    let mut placed = reentry_placed.lock().await;
+                    placed.insert(key);
+                }
+            }
+
+            // Second wave: if the $0.05 re-entry order is filled and that token's price goes below 0.7,
+            // place both Up and Down limit buys at $0.45 with 10x size (once per period).
+            {
+                let keys_to_check: Vec<(u64, String)> = {
+                    let reentry_placed_set = reentry_placed.lock().await;
+                    let second_wave = second_wave_placed.lock().await;
+                    reentry_placed_set.iter()
+                        .filter(|k| !second_wave.contains(k))
+                        .cloned()
+                        .collect()
+                };
+                for key in keys_to_check {
+                    let reentry_token_id = {
+                        let token_map = reentry_token_by_market.lock().await;
+                        token_map.get(&key).cloned()
+                    };
+                    let Some(reentry_token_id) = reentry_token_id else { continue };
+
+                    let reentry_trade = trader.get_pending_reentry_limit_trade(snapshot.period_timestamp, &reentry_token_id).await;
+                    let filled = match &reentry_trade {
+                        Some(t) => t.buy_order_confirmed,
+                        None => false,
+                    };
+                    if !filled {
+                        continue;
+                    }
+
+                    let get_bid = |up: &Option<crate::models::TokenPrice>, down: &Option<crate::models::TokenPrice>| -> Option<f64> {
+                        if up.as_ref().map(|t| t.token_id.as_str()) == Some(reentry_token_id.as_str()) {
+                            up.as_ref().and_then(|t| t.bid).and_then(|d| f64::try_from(d).ok())
+                        } else if down.as_ref().map(|t| t.token_id.as_str()) == Some(reentry_token_id.as_str()) {
+                            down.as_ref().and_then(|t| t.bid).and_then(|d| f64::try_from(d).ok())
+                        } else {
+                            None
+                        }
+                    };
+                    let price_f64 = if snapshot.btc_market.condition_id == key.1 {
+                        get_bid(&snapshot.btc_market.up_token, &snapshot.btc_market.down_token)
+                    } else if enable_eth && snapshot.eth_market.condition_id == key.1 {
+                        get_bid(&snapshot.eth_market.up_token, &snapshot.eth_market.down_token)
+                    } else if enable_solana && snapshot.solana_market.condition_id == key.1 {
+                        get_bid(&snapshot.solana_market.up_token, &snapshot.solana_market.down_token)
+                    } else if enable_xrp && snapshot.xrp_market.condition_id == key.1 {
+                        get_bid(&snapshot.xrp_market.up_token, &snapshot.xrp_market.down_token)
+                    } else {
+                        None
+                    };
+
+                    let Some(price) = price_f64 else { continue };
+                    if price >= SECOND_WAVE_PRICE_THRESHOLD {
+                        continue;
+                    }
+
+                    let (condition_id, up_token, down_token, up_type, down_type) = if snapshot.btc_market.condition_id == key.1 {
+                        (
+                            snapshot.btc_market.condition_id.clone(),
+                            snapshot.btc_market.up_token.clone(),
+                            snapshot.btc_market.down_token.clone(),
+                            crate::detector::TokenType::BtcUp,
+                            crate::detector::TokenType::BtcDown,
+                        )
+                    } else if enable_eth && snapshot.eth_market.condition_id == key.1 {
+                        (
+                            snapshot.eth_market.condition_id.clone(),
+                            snapshot.eth_market.up_token.clone(),
+                            snapshot.eth_market.down_token.clone(),
+                            crate::detector::TokenType::EthUp,
+                            crate::detector::TokenType::EthDown,
+                        )
+                    } else if enable_solana && snapshot.solana_market.condition_id == key.1 {
+                        (
+                            snapshot.solana_market.condition_id.clone(),
+                            snapshot.solana_market.up_token.clone(),
+                            snapshot.solana_market.down_token.clone(),
+                            crate::detector::TokenType::SolanaUp,
+                            crate::detector::TokenType::SolanaDown,
+                        )
+                    } else if enable_xrp && snapshot.xrp_market.condition_id == key.1 {
+                        (
+                            snapshot.xrp_market.condition_id.clone(),
+                            snapshot.xrp_market.up_token.clone(),
+                            snapshot.xrp_market.down_token.clone(),
+                            crate::detector::TokenType::XrpUp,
+                            crate::detector::TokenType::XrpDown,
+                        )
+                    } else {
+                        continue;
+                    };
+
+                    let (Some(up), Some(down)) = (up_token.as_ref(), down_token.as_ref()) else { continue };
+
+                    let second_wave_size = limit_shares.map(|s| s * 10.0).unwrap_or_else(|| (fixed_trade_amount * 10.0) / LIMIT_PRICE);
+
+                    crate::log_println!(
+                        "📉 SECOND WAVE: $0.05 re-entry filled, re-entry token price ${:.4} < ${:.2}. Placing both Up and Down at ${:.2} (10× size: {:.6} each)",
+                        price,
+                        SECOND_WAVE_PRICE_THRESHOLD,
+                        LIMIT_PRICE,
+                        second_wave_size
+                    );
+
+                    let opp_up = BuyOpportunity {
+                        condition_id: condition_id.clone(),
+                        token_id: up.token_id.clone(),
+                        token_type: up_type,
+                        bid_price: LIMIT_PRICE,
+                        period_timestamp: snapshot.period_timestamp,
+                        time_remaining_seconds: snapshot.time_remaining_seconds,
+                        time_elapsed_seconds,
+                        use_market_order: false,
+                        investment_amount_override: None,
+                        is_individual_hedge: false,
+                        is_standard_hedge: false,
+                        dual_limit_shares: None,
+                    };
+                    let opp_down = BuyOpportunity {
+                        condition_id: condition_id.clone(),
+                        token_id: down.token_id.clone(),
+                        token_type: down_type,
+                        bid_price: LIMIT_PRICE,
+                        period_timestamp: snapshot.period_timestamp,
+                        time_remaining_seconds: snapshot.time_remaining_seconds,
+                        time_elapsed_seconds,
+                        use_market_order: false,
+                        investment_amount_override: None,
+                        is_individual_hedge: false,
+                        is_standard_hedge: false,
+                        dual_limit_shares: None,
+                    };
+
+                    if let Err(e) = trader.execute_limit_buy(&opp_up, false, Some(second_wave_size), false).await {
+                        warn!("Second wave Up limit buy failed: {}", e);
+                    } else if let Err(e) = trader.execute_limit_buy(&opp_down, false, Some(second_wave_size), false).await {
+                        warn!("Second wave Down limit buy failed: {}", e);
+                    } else {
+                        let mut placed = second_wave_placed.lock().await;
+                        placed.insert(key.clone());
+                        crate::log_println!("✅ Second wave: both Up and Down limit orders at ${:.2} (10×) placed", LIMIT_PRICE);
+                    }
                 }
             }
         }

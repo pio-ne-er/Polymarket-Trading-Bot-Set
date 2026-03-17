@@ -159,6 +159,13 @@ async fn main() -> Result<()> {
         xrp_market_data,
         config.trading.check_interval_ms,
         is_simulation,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )?;
     let monitor_arc = Arc::new(monitor);
 
@@ -321,7 +328,7 @@ async fn main() -> Result<()> {
                     if trader.has_active_position(opportunity.period_timestamp, opportunity.token_type.clone()).await {
                         continue;
                     }
-                    if let Err(e) = trader.execute_limit_buy(&opportunity, false, limit_shares).await {
+                    if let Err(e) = trader.execute_limit_buy(&opportunity, false, limit_shares, false).await {
                         warn!("Error executing limit buy: {}", e);
                     }
                 }
